@@ -1,0 +1,3360 @@
+# =============================================================================
+#  sketch_wt.py  --  AMYBOARD ADVANCED WAVETABLE SYNTH v1
+#  4-voice / 8-oscillator MicroPython wavetable synth for AMYboard (AMY engine)
+# =============================================================================
+#
+#  ARCHITECTURE (per voice -- 5 AMY oscillators, 4 voices = 20 oscs, 8 sounding)
+#
+#      HEAD (SILENT)  <- filter + filter drive + voice pan + MOD4 envelope
+#        |  chained_osc
+#      OSC A (WAVETABLE)  -- position/pitch/level/drive, amp EG, MOD3 envelope
+#        |  chained_osc
+#      OSC B (WAVETABLE)  -- ditto
+#
+#      MOD1 osc (silent)  \  mod_source of HEAD / A / B  -> mod0 coefficient
+#      MOD2 osc (silent)  /                              -> mod1 coefficient
+#
+#  Each of the four voices is its OWN AMY synth (WT_SYNTH0..+3), not four
+#  voices of one synth.  This is deliberate and load-bearing -- see the
+#  "WHY FOUR SYNTHS" note below.  It is what makes per-voice unison detune and
+#  per-voice stereo spread possible at all, and it lets MONO / UNISON / POLY be
+#  three allocation policies over one fixed set of AMY objects, so switching
+#  mode allocates nothing and cuts no notes.
+#
+#  RULES INHERITED FROM THE MEGATRON (sketch_va8) BUILD -- DO NOT REGRESS:
+#    * amy.reset() at boot and on PANIC only.  Never on a parameter change.
+#    * vel=0 is note-off.
+#    * Bus 0 is always audible.
+#    * MIDI via midi.add_callback() -- never tulip.midi_callback(), which
+#      replaces the system dispatcher and breaks everything else.
+#    * A SOUNDING chain head filters ONLY ITSELF.  Only a wave=SILENT head is
+#      processed AFTER the chain is summed, so a voice-wide filter REQUIRES a
+#      silent head.  (src/amy.c render_osc_wave / render_envelope order.)
+#    * Per-osc `note` DOES NOT WORK inside a chain -- chained oscs are role
+#      SYNTH_IS_CHAINED and refuse notes.  All pitch offsets live in each osc's
+#      `freq` COEFFICIENT (const in Hz against REF_HZ, note coef 1).
+#    * `phase=` warps the RUNNING phase as well as setting the retrigger phase,
+#      so it is only ever sent on a full (re)build, never on a knob turn.
+#    * The head's amp must NOT carry an envelope: render_envelope() runs on the
+#      SUMMED chain for a SILENT osc, which would put a second VCA over the
+#      whole voice on top of each oscillator's own.
+#    * Display colours are 0..15 (framebuf GS4_HMSB low nibble), not 0..255.
+#    * OLED is an SH1107 at 0x3D; amyboard's autodetect binds the SSD1327
+#      driver to it and paints noise, so init_display() forces the driver.
+#
+#  VERIFIED AGAINST THE AMY SOURCE (shorepine/amy), not guessed -- see the
+#  "AMY CAPABILITY NOTES" block below for what is and is not available, and
+#  what each unavailable feature was replaced with.
+# =============================================================================
+
+import amy
+import tulip
+import time
+import math
+import json
+import array
+import os
+
+try:
+    import amyboard
+    HAVE_BOARD = True
+except Exception:
+    HAVE_BOARD = False
+
+try:
+    import midi as midimod
+    HAVE_MIDI = True
+except Exception:
+    HAVE_MIDI = False
+
+
+def clamp(v, lo, hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+# =============================================================================
+#  AMY CAPABILITY NOTES  --  what the brief asked for vs what AMY actually has
+# =============================================================================
+#  Checked against src/amy.h, src/oscillators.c, src/pcm.c, amy/__init__.py's
+#  _KW_MAP_LIST (the source of truth for send() kwargs) and docs/api.md.
+#
+#  AVAILABLE, USED AS ASKED
+#    * wave=WAVETABLE (amy.h: 19).  One preset = one 64-cycle table, 256
+#      samples per cycle, 16384 samples total.  `duty` crossfades across the
+#      cycles -- so WAVETABLE POSITION IS THE `duty` CONTROL-COEFFICIENT LIST,
+#      which means position scanning is modulated inside AMY's DSP by
+#      envelopes and LFOs at zero MicroPython cost.  (oscillators.c
+#      render_wavetable.)
+#    * Custom wavetables from SD.  render_wavetable calls
+#      pcm_get_sample_ram_for_preset(), and pcm.c's get_preset_for_preset_number
+#      checks RAM/memory presets FIRST -- they shadow the baked-in ROM presets.
+#      So amy.load_sample(path, preset=N) makes an SD .wav playable as
+#      wave=WAVETABLE, preset=N.  This is the whole SD wavetable mechanism.
+#    * Per-osc filter: filter_type 0-6 = none / LP12 / BP / HP / LP24 / NOTCH /
+#      PHASER, `resonance` 0.5-16, cutoff as a coefficient list (const Hz,
+#      other terms in OCTAVES) so cutoff modulation is free.
+#    * Two envelope generators per osc (bp0/eg0, bp1/eg1), up to 8 breakpoints,
+#      four curve shapes (eg0_type/eg1_type).  All envelopes are AMY's own --
+#      nothing is stepped from Python.
+#    * Distortion per osc AND per bus: dist_clip, dist_fold (wavefolder),
+#      dist_crush [bits,rate], dist_drive (coefs -> MODULATABLE), dist_mix.
+#    * Bus FX: reverb, chorus, echo, eq, plus the distortion block above.
+#    * portamento (ms) per osc, for MONO glide.
+#
+#  NOT AVAILABLE -- AND WHAT IS USED INSTEAD
+#    * OSCILLATOR SYNC.  AMY has no hard sync of any kind (no sync_osc /
+#      osc_sync anywhere in src/).  CLOSEST ALTERNATIVE, implemented: per-osc
+#      `phase` retrigger (PH.SYNC on the MIX page) locks both wavetables to a
+#      fixed start phase on every note-on, which gives the phase-coherent
+#      attack transient sync is usually reached for.  A real sync sweep is not
+#      possible without a C DSP slot.
+#    * TRUE AUDIO-RATE FM / RING MOD BETWEEN TWO WAVETABLES.  AMY's audio-rate
+#      FM engine is wave=ALGO, and docs/synth.md is explicit that ALGO operator
+#      sources must be SINE -- it cannot take wavetable operators.  The general
+#      `mod_source` path IS available to any wave, but it is evaluated once per
+#      audio BLOCK (control rate, AMY_BLOCK_SIZE/AMY_SAMPLE_RATE), not per
+#      sample.  IMPLEMENTED INSTEAD: MOD1/MOD2 have a RATE MODE -- as LFOs they
+#      are ordinary low-frequency modulators, and switched to AUDIO they track
+#      the played note by ratio and become FM/RM operators feeding the same
+#      coefficient slots.  MOD->PITCH is then FM, MOD->LEVEL is ring-mod
+#      flavour (log-domain, control-rate -- the aliased edge is characteristic,
+#      not a clean sideband spectrum).  This costs nothing extra: MOD1/MOD2 are
+#      silent mod oscs that already exist in every voice.
+#      Routing OSC B directly into OSC A as a mod_source would also work, but
+#      `mod_source` SILENCES the source oscillator -- it would cost the voice
+#      its second wavetable.  The shared-operator design above keeps both
+#      wavetables audible, which is what the brief actually wants.
+#    * FILTER RESONANCE MODULATION.  `resonance` is a plain float ('RF' in
+#      _KW_MAP_LIST), not a coefficient list, so nothing can modulate it inside
+#      AMY.  RESO is a static per-patch control; the MATRIX shows it as
+#      unavailable rather than pretending.
+#    * MODULATING AN FX PARAMETER, or an FM AMOUNT, per note.  Bus FX are bus
+#      scope -- they have no per-note modulation inputs at all (api.md is
+#      explicit that at bus scope only the const term of a coef list is used).
+#      An FM *amount* is itself a coefficient, and AMY cannot modulate a
+#      coefficient.  There is no workaround inside AMY: FM depth is the
+#      modulator's own amplitude, and a mod-source oscillator CANNOT carry an
+#      envelope either -- src/amy.c's note-on and note-off handlers both skip
+#      any osc whose role is SYNTH_IS_MOD_SOURCE (amy.c:1921 / :1983), so a mod
+#      osc never sees a velocity event and its EGs never fire.  An FM amount is
+#      therefore static per patch.  CLOSEST ALTERNATIVE, implemented: route
+#      MOD3/MOD4 (real envelopes) to the carrier's PITCH or LEVEL alongside the
+#      FM operator, which shapes how the FM reads across the note.  MOD1/MOD2
+#      phase CAN still be retriggered per note (TRIG on each MOD page), because
+#      `phase` is an ordinary parameter message, not a note event.
+#    * A BIPOLAR ENVELOPE / UNIPOLAR LFO as such.  AMY envelopes run 0..1 and
+#      an oscillator swings +/-1.  Both polarities are still provided, by
+#      compensating the destination's CONST term against the routing depth
+#      (see mod_terms()) -- exact for every linear/log destination.  Amplitude
+#      is the documented exception: amp coefficients combine in the LOG domain
+#      rather than adding, so amp routings are sent through un-compensated.
+#
+#  NOT VERIFIABLE FROM SOURCE ALONE -- CHECK ON YOUR BOARD
+#    * `wave=WAVETABLE` is compiled in only with -DAMY_WAVETABLE.  It is on in
+#      AMY's own Makefile and setup.py, but the AMYboard MicroPython firmware
+#      is built out of the tulipcc tree, which this sketch cannot inspect.  If
+#      your firmware lacks it, OSC A/B render silence.  Run wt_selftest() from
+#      the REPL: it plays a note, reads AMY's own output buffer back and tells
+#      you.  Set WT_ENABLED = False to fall back to SAW_DOWN oscillators and
+#      keep every other feature (filter, envelopes, matrix, FX) working.
+# =============================================================================
+
+# --------------------------------------------------------------------------
+#  SECTION 1 : CONFIGURATION
+# --------------------------------------------------------------------------
+SR = 44100          # AMYboard (ESP32-S3) AMY_SAMPLE_RATE
+BUS = 0             # bus 0 is always audible
+NVOICE = 4          # 4 voices, hard ceiling from the brief
+WT_SYNTH0 = 1       # voices occupy synths 1..4
+MUTE_VEL = 0.001
+
+# ---- per-voice oscillator map (voice-relative osc numbers) ----------------
+# mod_source / chained_osc are VOICE-RELATIVE inside a synth (docs/synth.md
+# Note 3), so these indices are exactly what gets sent.
+HEAD = 0            # SILENT: filter, filter drive, voice pan, MOD4 envelope
+OSC_A = 1           # WAVETABLE
+OSC_B = 2           # WAVETABLE
+MOD1_OSC = 3        # silent mod source -> mod0 coefficient
+MOD2_OSC = 4        # silent mod source -> mod1 coefficient
+OSCS_PER_VOICE = 5
+
+# AMY's logfreq reference (ZERO_LOGFREQ_IN_HZ in amy.h).  A freq coefficient
+# const of REF_HZ * 2**(semitones/12) is exactly a semitone offset riding on
+# top of whatever note the voice is playing.  const 0 is NOT "no offset" --
+# it is ZERO_HZ_LOG_VAL, i.e. silence -- so this is never allowed to reach 0.
+REF_HZ = 440.0
+
+# The head is a unity pass-through and must carry NO envelope (see the rules
+# block at the top).  Coefficients: const, note, vel, eg0.
+HEAD_AMP_CONST = 1.0
+
+# Waveform ids, read from the module where possible so a firmware renumber
+# cannot silently break us.
+W_SILENT = getattr(amy, "SILENT", 20)
+W_WAVETABLE = getattr(amy, "WAVETABLE", 19)
+W_SINE = getattr(amy, "SINE", 0)
+W_PULSE = getattr(amy, "PULSE", 1)
+W_SAW_DOWN = getattr(amy, "SAW_DOWN", 2)
+W_SAW_UP = getattr(amy, "SAW_UP", 3)
+W_TRIANGLE = getattr(amy, "TRIANGLE", 4)
+W_NOISE = getattr(amy, "NOISE", 5)
+
+# Set False if wt_selftest() says this firmware has no -DAMY_WAVETABLE.
+# Everything else in the synth keeps working; the two oscillators just render
+# a plain saw and the POSITION controls go inert.
+WT_ENABLED = True
+WT_FALLBACK_WAVE = W_SAW_DOWN
+
+# Control-coefficient slot indices, from parse_ctrl_coefs()'s docstring:
+#   0 const, 1 note, 2 vel, 3 eg0, 4 eg1, 5 mod0, 6 bend, 7 ext0, 8 ext1, 9 mod1
+C_CONST, C_NOTE, C_VEL, C_EG0, C_EG1, C_MOD0, C_BEND = 0, 1, 2, 3, 4, 5, 6
+C_MOD1 = 9
+NCOEF = 10
+
+# Cutoff safety ceiling.  filter_freq coefficients combine in the LOG domain:
+# the const is Hz but every other term adds OCTAVES, and AMY does not clamp the
+# sum -- a resonant biquad driven past Nyquist goes unstable and rings at a
+# fixed pitch on every note.  Inherited straight from the Megatron build.
+FILT_CEILING = 15000.0
+
+
+# --------------------------------------------------------------------------
+#  WHY FOUR SYNTHS, NOT ONE SYNTH WITH FOUR VOICES
+# --------------------------------------------------------------------------
+#  docs/synth.md is explicit: a command addressed to a synth is routed to the
+#  matching oscillator IN EVERY ONE OF ITS VOICES.  There is no way to address
+#  one voice of a synth differently from another -- that is the whole point of
+#  the abstraction.  So a single 4-voice synth CANNOT hold four different
+#  detunes, four different pans, or four different wavetable-position offsets:
+#  every voice would get the last value sent.  4x UNISON with per-voice detune,
+#  which the brief calls the primary mode, is simply not expressible that way.
+#
+#  Four single-voice synths solve it exactly.  Each carries its own detune,
+#  pan, and position offset, and the three voice modes become three ALLOCATION
+#  POLICIES over the same fixed set of AMY objects:
+#
+#      MONO    -> voice 0 only, portamento on, last-note priority
+#      UNISON  -> one note to all four voices, each at its own detune/pan
+#      POLY    -> notes distributed across the four, oldest-stolen
+#
+#  Nothing is created or destroyed when the mode changes -- only which voices
+#  get sent the note, and a cheap resend of the freq/pan coefficients.  That is
+#  the brief's "make voice allocation efficient so switching between modes does
+#  not create unnecessary AMY objects", and it also means a mode change never
+#  cuts a held note the way a reallocation would.
+#
+#  It also fixes something the Megatron build documented but could not use:
+#  per-osc `pan` is INERT inside a chain, because AMY pans the whole collected
+#  chain buffer once, through the HEAD's pan.  With one synth per voice, the
+#  head's pan IS the voice's pan -- so stereo spread across a unison stack
+#  works, where per-osc pan inside a single chain never could.
+# --------------------------------------------------------------------------
+VOICE_SYNTHS = [WT_SYNTH0 + i for i in range(NVOICE)]
+
+VOICE_MODES = ["MONO", "UNISON", "POLY"]
+VM_MONO, VM_UNISON, VM_POLY = 0, 1, 2
+
+# Unison detune curve, -1..+1 across the four voices.  At DETUNE = 15 cents
+# this produces exactly the brief's example spread: -15 / -5 / +5 / +15.
+UNI_DETUNE = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
+# Stereo positions for the unison stack, -1..+1 (scaled by WIDTH).
+UNI_PAN = [-1.0, 0.45, -0.45, 1.0]
+# Deliberately non-aligned start phases, so a unison stack does not collapse
+# into one big oscillator on the attack.
+UNI_PHASE = [0.00, 0.37, 0.61, 0.19]
+# Per-voice wavetable-position trim, scaled by POS SPR -- the "small per-voice
+# variations" the brief asks for, and the cheapest way to stop a unison stack
+# sounding like one oscillator turned up loud.
+UNI_POS = [-1.0, 0.4, -0.4, 1.0]
+
+LFO_SHAPES = ["SINE", "TRI", "SAW", "RAMP", "SQR", "S&H"]
+# S&H is NOISE: AMY's NOISE oscillator is sample-and-hold-ish at the block
+# rate when used as a mod source, which is what an S&H LFO is for.
+LFO_WAVE = [W_SINE, W_TRIANGLE, W_SAW_DOWN, W_SAW_UP, W_PULSE, W_NOISE]
+MOD_RATE_MODES = ["LFO", "AUDIO"]
+POLARITY = ["BIPOL", "UNIPOL"]
+EG_CURVES = ["RC", "LIN", "DX7", "EXP"]
+FILTERS = ["OFF", "LP12", "BP", "HP", "LP24", "NOTCH", "PHASR"]
+ONOFF = ["OFF", "ON"]
+
+# Tempo-sync divisions, in beats.  Rate becomes tempo/division when TSYNC is on.
+# Index 0 is OFF -- the free-running rate in Hz -- so tempo sync is one enum
+# rather than a separate on/off row competing for the eight-row ceiling.
+SYNC_DIVS = ["OFF", "4", "2", "1", "1/2", "1/4", "1/8", "1/16"]
+SYNC_BEATS = [0.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.125, 0.0625]
+
+
+# --------------------------------------------------------------------------
+#  MODULATION DESTINATIONS
+# --------------------------------------------------------------------------
+#  (id, 4-char label, scope, unit)
+#
+#  scope  'a'/'b'  = the wavetable oscillator, 'h' = the SILENT head
+#  unit   'lin'    = the destination's const adds directly (duty, pan)
+#         'oct'    = mod terms are OCTAVES on a const in Hz / linear gain
+#                    (freq, filter_freq, dist_drive) -- so a polarity offset
+#                    has to MULTIPLY the const, not add to it
+#         'amp'    = amp coefficients, which combine in the LOG domain rather
+#                    than adding; no polarity compensation is possible, so
+#                    these routings go through raw (documented, not silent)
+#
+#  Adding a destination later is one row here plus one branch in coefs_for();
+#  the matrix, the UI and the patch format all read this table.
+DESTS = [
+    ("a_pos", "A.POS", 'a', 'lin'),
+    ("b_pos", "B.POS", 'b', 'lin'),
+    ("a_pit", "A.PIT", 'a', 'oct'),
+    ("b_pit", "B.PIT", 'b', 'oct'),
+    ("a_lvl", "A.LVL", 'a', 'amp'),
+    ("b_lvl", "B.LVL", 'b', 'amp'),
+    ("a_drv", "A.DRV", 'a', 'oct'),
+    ("b_drv", "B.DRV", 'b', 'oct'),
+    ("cut",   "CUT",   'h', 'oct'),
+    ("f_drv", "F.DRV", 'h', 'oct'),
+    ("pan",   "PAN",   'h', 'lin'),
+]
+DEST_IDS = [d[0] for d in DESTS]
+DEST_LABELS = [d[1] for d in DESTS]
+DEST_SCOPE = dict((d[0], d[2]) for d in DESTS)
+DEST_UNIT = dict((d[0], d[3]) for d in DESTS)
+
+# Which coefficient slot each modulator lands in, and which scopes it can
+# reach.  MOD1/MOD2 are the two mod-source oscillators, so they are available
+# everywhere.  MOD3 is eg1 on the wavetable oscillators and MOD4 is eg1 on the
+# head -- an oscillator only has two EGs, and eg0 is already the amp envelope,
+# so these two are genuinely scope-limited.  The MATRIX page draws unreachable
+# pairs as "--" rather than accepting a value that would do nothing.
+MOD_SLOT_COEF = [C_MOD0, C_MOD1, C_EG1, C_EG1]
+MOD_SLOT_SCOPES = [('a', 'b', 'h'), ('a', 'b', 'h'), ('a', 'b'), ('h',)]
+MOD_IS_ENV = [False, False, True, True]
+NMOD = 4
+
+
+def mod_can_reach(slot, dest_id):
+    return DEST_SCOPE[dest_id] in MOD_SLOT_SCOPES[slot]
+
+
+# --------------------------------------------------------------------------
+#  SECTION 2 : PARAMETER MODEL
+# --------------------------------------------------------------------------
+P = {
+    # ---- oscillator A / B ------------------------------------------------
+    # "wt" is an INDEX into the wavetable catalogue (see section 3); a patch
+    # stores the FILENAME, never the index, so a patch survives the SD card
+    # gaining or losing tables.
+    # a_pos sits mid-low rather than at 0 so the default MOD1 swing has table
+    # on both sides of it -- at 0 the negative half of the LFO is simply
+    # clamped away and the movement reads as half-depth.
+    "a_wt": 0, "a_pos": 0.35, "a_coarse": 0.0, "a_fine": 0.0,
+    "a_lvl": 0.8, "a_phase": 0.0, "a_drv": 1.0, "a_fold": 0,
+    "b_wt": 0, "b_pos": 0.5, "b_coarse": 0.0, "b_fine": 7.0,
+    "b_lvl": 0.8, "b_phase": 0.25, "b_drv": 1.0, "b_fold": 0,
+    # ---- mix / global ----------------------------------------------------
+    "vmode": VM_UNISON, "glide": 0.0, "vsens": 0.4, "phsync": 1,
+    "bend": 2.0, "mch": 1, "vol": 4.0, "panic": 0,
+    # ---- filter ----------------------------------------------------------
+    "ftype": 4, "cutoff": 2500.0, "reso": 1.2, "fenv": 1.5,
+    "fkbd": 0.35, "fvel": 0.25, "fdrv": 1.0, "fmix": 1.0,
+    # ---- amp envelope (eg0 on OSC A and OSC B) ---------------------------
+    "aa": 8.0, "ad": 600.0, "as": 0.7, "ar": 350.0, "acurve": 0,
+    # ---- MOD 1 / MOD 2 : oscillator modulators ---------------------------
+    "m1_shape": 0, "m1_mode": 0, "m1_rate": 0.35, "m1_ratio": 1.0,
+    "m1_depth": 1.0, "m1_phase": 0.0, "m1_div": 0,
+    "m1_pol": 0, "m1_trig": 1,
+    "m2_shape": 1, "m2_mode": 0, "m2_rate": 0.12, "m2_ratio": 2.0,
+    "m2_depth": 1.0, "m2_phase": 0.25, "m2_div": 0,
+    "m2_pol": 0, "m2_trig": 0,
+    # ---- MOD 3 : envelope on the wavetable oscillators (eg1) -------------
+    "m3_a": 4.0, "m3_d": 900.0, "m3_s": 0.0, "m3_r": 400.0,
+    "m3_curve": 0, "m3_vel": 0.0, "m3_pol": 1,
+    # ---- MOD 4 : envelope on the head (eg1).  This IS the filter envelope;
+    #      the ENV page's FLT rows and this page edit the same generator.
+    "m4_a": 5.0, "m4_d": 700.0, "m4_s": 0.35, "m4_r": 400.0,
+    "m4_curve": 0, "m4_vel": 0.25, "m4_pol": 1,
+    # ---- matrix editor cursor (not a sound parameter, but it lives in the
+    #      grid like one so the encoder can drive it) ----------------------
+    "mx_slot": 0, "mx_dest": 0, "mx_amt": 0.0, "mx_clr": 0, "mx_clrall": 0,
+    # ---- unison ----------------------------------------------------------
+    "uni_det": 15.0, "uni_width": 0.6, "uni_pos": 0.12, "uni_phase": 0.5,
+    "uni_drift": 0.2,
+    # ---- bus distortion --------------------------------------------------
+    "d_drive": 1.0, "d_clip": 0, "d_fold": 0, "d_bits": 24, "d_rate": 1,
+    "d_mix": 1.0,
+    # ---- chorus / echo ---------------------------------------------------
+    "ch_lvl": 0.0, "ch_dly": 320.0, "ch_rate": 0.5, "ch_dep": 0.5,
+    "ec_lvl": 0.0, "ec_ms": 300.0, "ec_fb": 0.3, "ec_tone": 0.0,
+    # ---- reverb / eq -----------------------------------------------------
+    "rv_lvl": 0.12, "rv_live": 0.85, "rv_damp": 0.5, "rv_xover": 3000.0,
+    "eq_l": 0.0, "eq_m": 0.0, "eq_h": 0.0,
+    # ---- tempo (for MOD tempo sync) --------------------------------------
+    "tempo": 120.0,
+}
+
+# The modulation matrix: {(slot, dest_id): amount}.  Sparse on purpose -- only
+# routings that exist cost anything, and coefs_for() walks a handful of entries
+# rather than a 4x11 array on every parameter change.
+MATRIX = {}
+
+# Sensible starting patch: the wavetables move on their own, and MOD4 opens the
+# filter, so the synth makes a recognisably "wavetable" noise out of the box
+# rather than a static tone.
+MATRIX[(0, "a_pos")] = 0.35     # MOD1 (LFO) -> OSC A position
+MATRIX[(0, "b_pos")] = -0.25    # ...and OSC B the other way
+MATRIX[(2, "a_pos")] = 0.4      # MOD3 (env) -> OSC A position sweep
+# MOD4 -> CUTOFF is not stored here: it IS the filter envelope amount, so it
+# lives in P["fenv"] and is reached through mx_get/mx_set below.  One store,
+# two places to edit it (the FILTER page's ENV AMT row and the MATRIX page).
+
+
+def mx_get(slot, dest_id):
+    if slot == 3 and dest_id == "cut":
+        return P["fenv"]
+    return MATRIX.get((slot, dest_id), 0.0)
+
+
+def mx_set(slot, dest_id, amt):
+    if slot == 3 and dest_id == "cut":
+        P["fenv"] = amt
+        return
+    if amt == 0.0:
+        MATRIX.pop((slot, dest_id), None)
+    else:
+        MATRIX[(slot, dest_id)] = amt
+
+
+def mx_routings(scope):
+    """Every live routing reaching `scope`, as (slot, dest_id, amount).
+
+    Walks the destination table rather than the MATRIX dict so the synthetic
+    MOD4->CUTOFF entry above is included exactly once."""
+    out = []
+    for dest_id, label, dscope, unit in DESTS:
+        if dscope != scope:
+            continue
+        for slot in range(NMOD):
+            if not mod_can_reach(slot, dest_id):
+                continue
+            amt = mx_get(slot, dest_id)
+            if amt != 0.0:
+                out.append((slot, dest_id, amt))
+    return out
+
+
+# --------------------------------------------------------------------------
+#  SECTION 3 : WAVETABLE MANAGEMENT
+# --------------------------------------------------------------------------
+#  HOW THIS ACTUALLY WORKS IN AMY -- verified, not assumed:
+#
+#    oscillators.c render_wavetable() looks its table up with
+#    pcm_get_sample_ram_for_preset(synth[osc]->preset), and pcm.c's
+#    get_preset_for_preset_number() searches the MEMORY preset list FIRST,
+#    falling back to the baked-in ROM presets only if nothing matches.  A
+#    memory preset therefore SHADOWS a ROM one.
+#
+#    So: amy.load_sample("/sd/wavetables/user/foo.wav", preset=N) followed by
+#    amy.send(osc=..., wave=WAVETABLE, preset=N) plays an SD-card wavetable.
+#    That is the entire mechanism, and it needs no firmware change.
+#
+#  TWO CONSTRAINTS THAT FALL OUT OF THE SAME CODE, AND ARE OBEYED HERE:
+#
+#    1. It must be a RAM sample, not a streamed one.  amy.disk_sample() sets
+#       file_handle and leaves sample_ram NULL; render_wavetable() bails out on
+#       a NULL table and renders silence.  So wavetables go through
+#       load_sample() (RAM) and are never streamed from disk.
+#
+#    2. RAM is the real budget.  A full 64-cycle table is 16384 samples =
+#       32 KB.  Hence WT_SLOTS below: a small LRU of preset slots, so a patch
+#       loads the two tables it names and nothing else -- the brief's "avoid
+#       loading unnecessary tables into RAM", made concrete.
+#
+#  Loading is also SLOW: load_sample() pushes the sample over the wire protocol
+#  in 94-frame chunks, so a 16384-frame table is ~175 messages.  That is fine
+#  on a patch change and disastrous inside loop(), so it only ever happens from
+#  an explicit table selection or patch load, with the voices silenced first.
+# --------------------------------------------------------------------------
+WT_CYCLE = 256                  # WAVETABLE_SAMPLES_PER_CYCLE (oscillators.c)
+WT_MIN_SAMPLES = 2 * WT_CYCLE   # render_wavetable needs two cycles to crossfade
+WT_FULL = 64 * WT_CYCLE         # the canonical 64-cycle / 16384-sample table
+
+# Preset numbers we load user tables into.  Chosen above AMY's own ranges: ROM
+# PCM is 0..18, the Gamma9001 drum banks are 256..391, and 384..390 are the GM
+# kit patches.  400+ collides with nothing, and memory presets shadow anyway.
+WT_PRESET0 = 400
+WT_SLOTS = 4                    # 4 x 32 KB worst case; a patch only needs 2
+
+# The wavetables baked into the firmware, exposed so the synth is playable with
+# no SD card at all.  GAMMA9001 builds (which AMYboard is) put them at PCM
+# preset 19; pcm_tiny.h defines 5 of them.
+WT_BUILTIN_BASE = 19
+WT_BUILTIN_COUNT = 5
+
+WT_DIRS = ("factory", "user")   # under WT_ROOT, per the brief's layout
+
+
+def _sd_root():
+    """Where the SD card is mounted.
+
+    On this board the card is a plain mounted filesystem under
+    tulip.root_dir() + 'sd' -- the same path sdbrowser.py uses -- so no special
+    API is needed.  Falls back to internal flash so a card-less board still
+    finds /user/wavetables and works."""
+    try:
+        r = tulip.root_dir()
+        if not r.endswith("/"):
+            r += "/"
+        sd = r + "sd"
+        os.listdir(sd)
+        return sd
+    except Exception:
+        pass
+    try:
+        os.listdir("/sd")
+        return "/sd"
+    except Exception:
+        pass
+    return "/user"
+
+
+WT_ROOT = None          # resolved once at boot by wt_scan()
+
+# The catalogue: a list of (display_name, path_or_None, builtin_preset_or_None).
+# Index 0.. are what the OSC A/B TABLE knobs select between.  Built-ins come
+# first so the knob always has something valid at index 0.
+WT_CATALOG = []
+
+# path -> preset slot, plus an LRU of slot usage.
+_wt_slot_of = {}
+_wt_slot_lru = []
+_wt_failed = set()      # paths that would not load; never retried automatically
+
+
+def wt_scan():
+    """Build the wavetable catalogue from the SD card.
+
+    Never raises: a missing card, a missing directory or an unreadable entry
+    each just contribute nothing, and the built-ins are always present."""
+    global WT_ROOT, WT_CATALOG
+    WT_CATALOG = []
+    for i in range(WT_BUILTIN_COUNT):
+        WT_CATALOG.append(("INT %d" % i, None, WT_BUILTIN_BASE + i))
+    WT_ROOT = _sd_root() + "/wavetables"
+    for sub in WT_DIRS:
+        d = WT_ROOT + "/" + sub
+        try:
+            names = sorted(os.listdir(d))
+        except Exception:
+            continue
+        for n in names:
+            ln = n.lower()
+            if not (ln.endswith(".wav") or ln.endswith(".wt")):
+                continue
+            # Tag factory vs user in the display name so two tables with the
+            # same filename in different folders stay tellable apart.
+            disp = ("F:" if sub == "factory" else "") + n.rsplit(".", 1)[0]
+            WT_CATALOG.append((disp[:12], d + "/" + n, None))
+    return len(WT_CATALOG)
+
+
+def wt_count():
+    return len(WT_CATALOG) if WT_CATALOG else 1
+
+
+def wt_name(idx):
+    if not WT_CATALOG:
+        return "-"
+    return WT_CATALOG[int(clamp(idx, 0, len(WT_CATALOG) - 1))][0]
+
+
+def wt_path(idx):
+    if not WT_CATALOG:
+        return None
+    return WT_CATALOG[int(clamp(idx, 0, len(WT_CATALOG) - 1))][1]
+
+
+def wt_index_of_path(path):
+    """Catalogue index for a stored patch filename, or -1 if it is gone.
+
+    Patches store the PATH, so a table that moved or was deleted is detected
+    here and reported, rather than silently selecting whatever now sits at the
+    old index."""
+    for i in range(len(WT_CATALOG)):
+        if WT_CATALOG[i][1] == path:
+            return i
+    return -1
+
+
+def _wt_claim_slot(path):
+    """Reserve a preset slot for `path`, evicting the least-recently-used.
+
+    Returns (preset_number, already_loaded)."""
+    if path in _wt_slot_of:
+        slot = _wt_slot_of[path]
+        if path in _wt_slot_lru:
+            _wt_slot_lru.remove(path)
+        _wt_slot_lru.append(path)
+        return slot, True
+    used = set(_wt_slot_of.values())
+    slot = None
+    for s in range(WT_PRESET0, WT_PRESET0 + WT_SLOTS):
+        if s not in used:
+            slot = s
+            break
+    if slot is None:
+        # Evict the oldest table.  amy.unload_sample() frees its RAM -- without
+        # this the memory preset list would just keep growing.
+        victim = _wt_slot_lru.pop(0)
+        slot = _wt_slot_of.pop(victim)
+        try:
+            amy.unload_sample(slot)
+        except Exception as e:
+            print("wt: unload of preset", slot, "failed:", e)
+    _wt_slot_of[path] = slot
+    _wt_slot_lru.append(path)
+    return slot, False
+
+
+def wt_preset_for(idx):
+    """The AMY preset number to play for catalogue entry `idx`, loading the
+    table into RAM if it is not already there.
+
+    Returns None if the entry cannot be played, in which case the caller falls
+    back to a built-in.  Every failure path is handled: missing file, unreadable
+    WAV, a table too short for AMY to crossfade, and a load that throws."""
+    if not WT_CATALOG:
+        return WT_BUILTIN_BASE
+    idx = int(clamp(idx, 0, len(WT_CATALOG) - 1))
+    name, path, builtin = WT_CATALOG[idx]
+    if builtin is not None:
+        return builtin
+    if path in _wt_failed:
+        return None
+    slot, loaded = _wt_claim_slot(path)
+    if loaded:
+        return slot
+    try:
+        sz = os.stat(path)[6]
+    except Exception:
+        print("wt: missing", path)
+        _wt_failed.add(path)
+        _wt_slot_of.pop(path, None)
+        if path in _wt_slot_lru:
+            _wt_slot_lru.remove(path)
+        return None
+    # A WAV header is 44 bytes; anything that cannot hold two 256-sample cycles
+    # of 16-bit mono is not a wavetable AMY can crossfade.
+    if sz < 44 + WT_MIN_SAMPLES * 2:
+        print("wt: too short (%d bytes), need %d+" % (sz, 44 + WT_MIN_SAMPLES * 2))
+        _wt_failed.add(path)
+        return None
+    try:
+        amy.load_sample(path, preset=slot, midinote=60)
+    except Exception as e:
+        print("wt: load failed for", path, "--", e)
+        _wt_failed.add(path)
+        _wt_slot_of.pop(path, None)
+        if path in _wt_slot_lru:
+            _wt_slot_lru.remove(path)
+        return None
+    return slot
+
+
+def wt_preset_or_fallback(idx):
+    p = wt_preset_for(idx)
+    if p is None:
+        toast("WT LOAD FAIL")
+        return WT_BUILTIN_BASE
+    return p
+
+
+def wt_rescan():
+    """Re-read the card (an SD swap, or tables copied over while running).
+
+    Clears the failure list so a table that was missing gets another chance,
+    but keeps the loaded-slot cache: a path that is still present is still
+    valid in RAM, so a rescan does not force a reload of what is playing."""
+    _wt_failed.clear()
+    n = wt_scan()
+    # A patch names its tables by path; re-resolve both in case indices moved.
+    _repair_wt_indices()
+    return n
+
+
+_a_wt_path = None       # path the patch asked for, or None for a built-in
+_b_wt_path = None
+
+
+def _repair_wt_indices():
+    """Point a_wt / b_wt back at the paths the patch actually named."""
+    for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
+        if path is None:
+            continue
+        i = wt_index_of_path(path)
+        if i >= 0:
+            P[key] = i
+        else:
+            print("wt: patch table missing:", path)
+            P[key] = 0
+
+
+def wt_remember_selection():
+    """Record the current selections as PATHS, for the patch file."""
+    global _a_wt_path, _b_wt_path
+    _a_wt_path = wt_path(P["a_wt"])
+    _b_wt_path = wt_path(P["b_wt"])
+
+
+# --------------------------------------------------------------------------
+#  SECTION 4 : OSCILLATOR CONFIGURATION AND THE MODULATION MATRIX
+# --------------------------------------------------------------------------
+#  Everything below builds AMY ControlCoefficient strings.  This is the whole
+#  point of the design: the matrix is evaluated HERE, in Python, once per
+#  parameter change or note -- never per sample and never per loop() tick --
+#  and the result is a set of coefficients that AMY's DSP then applies at audio
+#  rate for free.  There is no per-sample arithmetic anywhere in this file.
+#
+#  A coefficient list is 10 slots (see C_* above).  A slot left None is sent as
+#  an empty field, which AMY reads as "leave this one alone" -- so we only ever
+#  transmit what we actually mean to set.
+# --------------------------------------------------------------------------
+
+def coef_str(c):
+    """Render a coefficient list, trimming trailing unspecified slots."""
+    n = len(c)
+    while n > 0 and c[n - 1] is None:
+        n -= 1
+    out = []
+    for i in range(n):
+        v = c[i]
+        out.append("" if v is None else ("%.4f" % v).rstrip("0").rstrip("."))
+    return ",".join(out)
+
+
+def mod_terms(slot, amt, unit):
+    """(const_offset, coefficient) for one routing, honouring its polarity.
+
+    AMY has no bipolar envelope and no unipolar oscillator: an EG runs 0..1 and
+    an oscillator swings +/-1.  Both polarities are still delivered exactly, by
+    moving the destination's CONST term to compensate --
+
+        LFO, bipolar   : swings -amt..+amt about const   (natural)
+        LFO, unipolar  : coef amt/2, const +amt/2  -> const..const+amt
+        ENV, unipolar  : rises 0..amt from const          (natural)
+        ENV, bipolar   : coef 2*amt, const -amt    -> const-amt..const+amt
+
+    `unit` decides how the offset is applied by the caller: 'lin' adds it,
+    'oct' multiplies the const by 2**offset (freq / filter_freq / dist_drive
+    coefficients are octaves on a const in Hz or linear gain), and 'amp' takes
+    no offset at all -- amp coefficients combine in the LOG domain rather than
+    summing, so there is no const term that would shift a log-combined
+    modulation by a fixed amount.  That last case is a documented limit, not an
+    oversight; an amp routing is simply always its natural polarity."""
+    if unit == 'amp':
+        return 0.0, amt
+    unipolar = P["m%d_pol" % (slot + 1)] == 1
+    if MOD_IS_ENV[slot]:
+        if unipolar:
+            return 0.0, amt
+        return -amt, 2.0 * amt
+    if unipolar:
+        return amt * 0.5, amt * 0.5
+    return 0.0, amt
+
+
+def _apply_routings(coefs, dest_id, const, unit):
+    """Fold every live routing to `dest_id` into `coefs`, returning the new
+    const.  One place, so adding a destination never means remembering to
+    update the polarity or scope logic again."""
+    for slot in range(NMOD):
+        if not mod_can_reach(slot, dest_id):
+            continue
+        amt = mx_get(slot, dest_id)
+        if amt == 0.0:
+            continue
+        off, coef = mod_terms(slot, amt, unit)
+        idx = MOD_SLOT_COEF[slot]
+        coefs[idx] = (coefs[idx] or 0.0) + coef
+        if unit == 'lin':
+            const += off
+        elif unit == 'oct' and off != 0.0:
+            const *= 2.0 ** off
+    return const
+
+
+def _up_octaves(dest_id, extra=0.0):
+    """Worst-case UPWARD modulation on a destination, in octaves.
+
+    Used to keep a resonant filter under FILT_CEILING: AMY does not clamp the
+    summed filter_freq coefficients, and a biquad driven past Nyquist goes
+    unstable and rings at a fixed pitch on every note."""
+    up = extra
+    for slot in range(NMOD):
+        if not mod_can_reach(slot, dest_id):
+            continue
+        amt = mx_get(slot, dest_id)
+        if amt <= 0.0:
+            continue
+        off, coef = mod_terms(slot, amt, 'oct')
+        up += abs(coef) + max(0.0, off)
+    return up
+
+
+# ---- per-voice offsets ----------------------------------------------------
+#  These are what make four separate synths worth having.  In MONO and POLY
+#  every voice is an independent note, so they all sit at zero; in UNISON they
+#  spread the stack.
+
+def _unison_active():
+    return int(P["vmode"]) == VM_UNISON
+
+
+def voice_cents(v):
+    if not _unison_active():
+        return 0.0
+    return UNI_DETUNE[v] * P["uni_det"] + _drift_cents[v]
+
+
+def voice_pan(v):
+    if not _unison_active():
+        return 0.5
+    return clamp(0.5 + UNI_PAN[v] * P["uni_width"] * 0.5, 0.0, 1.0)
+
+
+def voice_pos_offset(v):
+    if not _unison_active():
+        return 0.0
+    return UNI_POS[v] * P["uni_pos"]
+
+
+def voice_phase(v, base):
+    if not _unison_active():
+        return base
+    return (base + UNI_PHASE[v] * P["uni_phase"]) % 1.0
+
+
+# ---- coefficient builders -------------------------------------------------
+
+def osc_freq_coefs(which, v):
+    """freq for OSC A or B of voice v.
+
+    The pitch offset is a freq COEFFICIENT CONST in Hz, never a per-osc note --
+    a chained oscillator refuses notes outright (role SYNTH_IS_CHAINED), which
+    is the single most expensive lesson from the Megatron build.  A const of
+    REF_HZ * 2**(semitones/12) is a pure log-domain offset riding on whatever
+    note the head is playing.
+
+    `bend` MUST stay 1.0: AMY's default freq coefs are 0,1,0,0,0,0,1 and pitch
+    bend rides that last slot, so sending freq at all means re-asserting it or
+    the bend wheel goes dead."""
+    semis = P[which + "_coarse"] + P[which + "_fine"] / 100.0 + voice_cents(v) / 100.0
+    const = REF_HZ * (2.0 ** (semis / 12.0))
+    c = [None] * NCOEF
+    c[C_NOTE] = 1.0
+    c[C_BEND] = 1.0
+    const = _apply_routings(c, which + "_pit", const, 'oct')
+    # A freq const of 0 is ZERO_HZ_LOG_VAL (silence), not "no offset".
+    c[C_CONST] = max(1.0, const)
+    return coef_str(c)
+
+
+def osc_duty_coefs(which, v):
+    """duty for OSC A or B -- i.e. WAVETABLE POSITION.
+
+    `duty` is what crossfades across the 64 cycles of a wavetable preset
+    (oscillators.c render_wavetable), and it is a full coefficient list, so
+    position scanning is modulated inside AMY's DSP at no MicroPython cost.
+    This is the single most important line in the whole synth."""
+    const = P[which + "_pos"] + voice_pos_offset(v)
+    c = [None] * NCOEF
+    const = _apply_routings(c, which + "_pos", const, 'lin')
+    # AMY clamps the interpolation itself, but keeping the const in range means
+    # the modulation swings around a position that is actually on the table.
+    c[C_CONST] = clamp(const, 0.0, 1.0)
+    return coef_str(c)
+
+
+def osc_amp_coefs(which):
+    """amp for OSC A or B.
+
+    Coefficients: const gain, note, vel, eg0 (the amp envelope), plus any
+    routings.  The vel coefficient is velocity SENSITIVITY, not a gain -- amp
+    coefs combine in a log domain where a full-velocity note contributes 0
+    whatever the coef is, so lowering it lifts SOFT notes toward full while
+    leaving hard hits untouched."""
+    c = [None] * NCOEF
+    c[C_CONST] = clamp(P[which + "_lvl"], 0.0, 1.0)
+    c[C_VEL] = clamp(P["vsens"], 0.0, 1.0)
+    c[C_EG0] = 1.0
+    _apply_routings(c, which + "_lvl", 0.0, 'amp')
+    return coef_str(c)
+
+
+def osc_drive_coefs(which):
+    """dist_drive for OSC A or B: the per-oscillator drive / wavefold depth.
+
+    api.md: the const is LINEAR drive (1/16..16), and the modulation coefs are
+    OCTAVES of it.  dist_drive is shared by whichever stages are enabled, so
+    this is both the saturator's drive and the wavefolder's fold depth."""
+    c = [None] * NCOEF
+    const = _apply_routings(c, which + "_drv", P[which + "_drv"], 'oct')
+    c[C_CONST] = clamp(const, 0.0625, 16.0)
+    return coef_str(c)
+
+
+def head_filter_coefs():
+    """filter_freq on the SILENT head -- one filter across the summed voice.
+
+    The const is Hz; note (keyboard tracking), vel and every modulation term
+    add OCTAVES on top.  AMY does not clamp the sum, so the const is pulled
+    down until the worst case stays under FILT_CEILING.  The knob still reads
+    what you set; only the sum is limited."""
+    # Worst-case upward modulation, in octaves.  Keyboard tracking is NOT
+    # fkbd octaves: the note term is scaled by the note's own log-frequency
+    # relative to A4, so at MIDI 127 a tracking of 1.0 is (127-69)/12 = 4.83
+    # octaves.  Under-counting that is how a "safe" cutoff still rings at the
+    # top of the keyboard.
+    kbd_oct = P["fkbd"] * ((127.0 - 69.0) / 12.0)
+    up = _up_octaves("cut", kbd_oct + P["fvel"])
+    const = clamp(P["cutoff"], 20.0, FILT_CEILING)
+    c = [None] * NCOEF
+    c[C_NOTE] = P["fkbd"]
+    c[C_VEL] = P["fvel"]
+    const = _apply_routings(c, "cut", const, 'oct')
+    const = clamp(const, 20.0, FILT_CEILING)
+
+    # Pull the const down first -- that keeps the modulation depth you dialled
+    # in, and is enough for any sane patch.
+    if up > 0.0:
+        ceiling = FILT_CEILING / (2.0 ** up)
+        if const > ceiling:
+            const = max(20.0, ceiling)
+        # If even the 20 Hz floor cannot absorb it, the modulation itself is
+        # asking to go past Nyquist, so scale the terms down until the worst
+        # case lands exactly on FILT_CEILING.  A resonant biquad driven past
+        # Nyquist goes unstable and rings at a fixed pitch on every note; a
+        # slightly shallower sweep is the better failure.
+        allowed = math.log(FILT_CEILING / const) / math.log(2.0)
+        if up > allowed:
+            scale = max(0.0, allowed / up)
+            c[C_NOTE] = P["fkbd"] * scale
+            c[C_VEL] = P["fvel"] * scale
+            for i in (C_EG0, C_EG1, C_MOD0, C_MOD1):
+                if c[i]:
+                    c[i] = c[i] * scale
+    c[C_CONST] = const
+    return coef_str(c)
+
+
+def head_drive_coefs():
+    c = [None] * NCOEF
+    const = _apply_routings(c, "f_drv", P["fdrv"], 'oct')
+    c[C_CONST] = clamp(const, 0.0625, 16.0)
+    return coef_str(c)
+
+
+def head_pan_coefs(v):
+    """pan on the head -- the VOICE's pan.
+
+    Per-osc pan inside a chain is inert: AMY pans the whole collected chain
+    buffer once, through the head (verified in the Megatron build).  With one
+    synth per voice that is exactly what we want -- this is the unison stack's
+    stereo spread, and it is only reachable because of the four-synth layout."""
+    c = [None] * NCOEF
+    const = _apply_routings(c, "pan", voice_pan(v), 'lin')
+    c[C_CONST] = clamp(const, 0.0, 1.0)
+    return coef_str(c)
+
+
+# ---- envelopes ------------------------------------------------------------
+#  Every envelope here is an AMY breakpoint set.  Nothing is stepped from
+#  Python -- the brief's "use AMY's own envelope functionality rather than
+#  calculating envelopes continuously in MicroPython", and the reason the main
+#  loop can stay at UI rate.
+#
+#  Breakpoint format: time_ms,value pairs, the LAST pair being the release
+#  (which triggers on note-off).  So "A,1,D,S,R,0" is a standard ADSR.
+
+def adsr_bp(a, d, s, r):
+    return "%d,1,%d,%.3f,%d,0" % (int(a), int(d), clamp(s, 0.0, 1.0), int(r))
+
+
+def amp_bp():
+    return adsr_bp(P["aa"], P["ad"], P["as"], P["ar"])
+
+
+def mod3_bp():
+    return adsr_bp(P["m3_a"], P["m3_d"], P["m3_s"], P["m3_r"])
+
+
+def mod4_bp():
+    return adsr_bp(P["m4_a"], P["m4_d"], P["m4_s"], P["m4_r"])
+
+
+# --------------------------------------------------------------------------
+#  SECTION 5 : LFOs / MODULATORS  (MOD1 and MOD2, one pair per voice)
+# --------------------------------------------------------------------------
+#  These are ordinary AMY oscillators named as another osc's `mod_source`, at
+#  which point AMY silences them and routes their output into the mod0 / mod1
+#  coefficient slots.  Every voice carries its own pair, which costs nothing
+#  (they are silent) and buys the per-voice modulation variation that makes a
+#  unison stack sound like four oscillators rather than one loud one.
+#
+#  HARD CONSTRAINT, verified in src/amy.c: an osc with role SYNTH_IS_MOD_SOURCE
+#  is SKIPPED by both the note-on and the note-off handler (amy.c:1921, :1983).
+#  So a mod oscillator:
+#    * can never carry an envelope (its EGs would never be triggered), which is
+#      why its amp is a bare constant with vel and eg0 explicitly ZEROED -- the
+#      AMY default amp coefs are 1,0,1,1, and leaving eg0 at 1 on an osc that
+#      never gets a note-on would hold the modulator at zero forever; and
+#    * cannot be note-retriggered with a note event -- TRIG instead re-sends
+#      `phase`, which is a plain parameter message and warps the running phase.
+
+def mod_rate_hz(n):
+    """LFO rate for MOD n (1 or 2), honouring tempo sync."""
+    div = int(clamp(P["m%d_div" % n], 0, len(SYNC_BEATS) - 1))
+    beats = SYNC_BEATS[div]
+    if div > 0 and beats > 0.0:
+        return clamp((P["tempo"] / 60.0) / beats, 0.01, 100.0)
+    return clamp(P["m%d_rate" % n], 0.01, 100.0)
+
+
+def mod_freq_coefs(n):
+    """freq for MOD n.
+
+    LFO mode is an ABSOLUTE frequency, so `note` and `bend` are explicitly
+    zeroed -- AMY's default freq coefs are 0,1,0,0,0,0,1 and leaving them would
+    make the LFO track the keyboard.  AUDIO mode does the opposite: the const
+    becomes REF_HZ * ratio and note/bend go back to 1, turning the modulator
+    into an FM/RM operator that tracks the played note."""
+    c = [None] * NCOEF
+    if P["m%d_mode" % n] == 1:          # AUDIO -- an FM / ring-mod operator
+        c[C_CONST] = max(1.0, REF_HZ * clamp(P["m%d_ratio" % n], 0.01, 32.0))
+        c[C_NOTE] = 1.0
+        c[C_BEND] = 1.0
+    else:                                # LFO -- free-running, absolute Hz
+        c[C_CONST] = mod_rate_hz(n)
+        c[C_NOTE] = 0.0
+        c[C_VEL] = 0.0
+        c[C_EG0] = 0.0
+        c[C_EG1] = 0.0
+        c[C_MOD0] = 0.0
+        c[C_BEND] = 0.0
+    return coef_str(c)
+
+
+def mod_amp_coefs(n):
+    """amp for MOD n -- the modulation DEPTH, and nothing else.
+
+    vel and eg0 are forced to 0 for the reason in the section note above: this
+    oscillator will never receive a note event, so any envelope term would pin
+    it at silence."""
+    c = [None] * NCOEF
+    c[C_CONST] = clamp(P["m%d_depth" % n], 0.0, 1.0)
+    c[C_NOTE] = 0.0
+    c[C_VEL] = 0.0
+    c[C_EG0] = 0.0
+    return coef_str(c)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 6 : VOICE CONSTRUCTION
+# --------------------------------------------------------------------------
+_drift_cents = [0.0] * NVOICE       # slow analogue wander, written by service_drift()
+
+
+def _stage_needed(prefix, drv_key, fold_key):
+    """Whether an oscillator's distortion block has to be switched on at all.
+
+    An always-on soft clipper colours the sound even at unity drive, so the
+    stages are enabled only when the patch actually asks for them -- including
+    the case where drive sits at 1 but a MOD routing pushes it up."""
+    if P[fold_key]:
+        return True
+    if P[drv_key] > 1.001:
+        return True
+    for slot in range(NMOD):
+        if mx_get(slot, prefix + "_drv") != 0.0:
+            return True
+    return False
+
+
+def _send_osc_wt(sy, v, which, osc, chain_to, full):
+    """Configure one wavetable oscillator (OSC A or OSC B)."""
+    idx = int(P[which + "_wt"])
+    kw = {"synth": sy, "osc": osc}
+    if WT_ENABLED:
+        kw["wave"] = W_WAVETABLE
+        kw["preset"] = wt_preset_or_fallback(idx)
+    else:
+        # No -DAMY_WAVETABLE in this firmware: keep every other feature alive
+        # on a plain oscillator rather than rendering silence.
+        kw["wave"] = WT_FALLBACK_WAVE
+    kw["freq"] = osc_freq_coefs(which, v)
+    kw["duty"] = osc_duty_coefs(which, v)
+    kw["amp"] = osc_amp_coefs(which)
+    # mod_source is VOICE-RELATIVE inside a synth (docs/synth.md Note 3): these
+    # are osc numbers within this voice, not absolute.  First entry feeds mod0,
+    # second feeds mod1.
+    kw["mod_source"] = [MOD1_OSC, MOD2_OSC]
+    kw["portamento"] = int(P["glide"])
+    if chain_to is not None:
+        kw["chained_osc"] = chain_to
+    # The oscillators never filter their own slice -- that would happen BEFORE
+    # the sum reaches the head, i.e. the filter would run twice.
+    kw["filter_type"] = 0
+    on = _stage_needed(which, which + "_drv", which + "_fold")
+    kw["dist_clip"] = 1 if on else 0
+    kw["dist_fold"] = 1 if (on and P[which + "_fold"]) else 0
+    if on:
+        kw["dist_drive"] = osc_drive_coefs(which)
+    if full:
+        kw["bp0"] = amp_bp()            # eg0 = amp envelope
+        kw["bp1"] = mod3_bp()           # eg1 = MOD3, the free assignable envelope
+        kw["eg0_type"] = int(P["acurve"])
+        kw["eg1_type"] = int(P["m3_curve"])
+        # `phase` warps the RUNNING phase as well as arming the retrigger
+        # phase, so it is only ever sent on a full rebuild -- sending it on a
+        # knob turn clicks every held note.
+        if P["phsync"]:
+            kw["phase"] = "%.3f" % voice_phase(v, P[which + "_phase"])
+    amy.send(**kw)
+
+
+def _send_head(sy, v, full):
+    """The SILENT head: the voice's filter, drive, pan and MOD4 envelope.
+
+    SILENT is what makes a voice-wide filter possible at all -- a sounding
+    chain head filters only its own buffer, while a silent one is processed
+    after the chain has been summed."""
+    kw = {"synth": sy, "osc": HEAD,
+          "wave": W_SILENT,
+          # Unity pass-through, and deliberately NO envelope and NO velocity:
+          # render_envelope() runs on the SUMMED chain for a silent osc, so an
+          # envelope here would stack a second VCA over the whole voice.
+          "amp": "1,0,0,0",
+          "chained_osc": OSC_A,
+          "mod_source": [MOD1_OSC, MOD2_OSC],
+          "pan": head_pan_coefs(v),
+          "filter_type": int(P["ftype"]),
+          "resonance": round(clamp(P["reso"], 0.5, 16.0), 3),
+          "filter_freq": head_filter_coefs(),
+          "portamento": int(P["glide"])}
+    hon = P["fdrv"] > 1.001 or any(mx_get(s, "f_drv") != 0.0 for s in range(NMOD))
+    kw["dist_clip"] = 1 if hon else 0
+    if hon:
+        kw["dist_drive"] = head_drive_coefs()
+        kw["dist_mix"] = "%.3f" % clamp(P["fmix"], 0.0, 1.0)
+    if full:
+        kw["bp1"] = mod4_bp()           # eg1 = MOD4 = the filter envelope
+        kw["eg1_type"] = int(P["m4_curve"])
+    amy.send(**kw)
+
+
+def _send_mod_osc(sy, n, osc, full):
+    kw = {"synth": sy, "osc": osc,
+          "wave": LFO_WAVE[int(clamp(P["m%d_shape" % n], 0, len(LFO_WAVE) - 1))],
+          "freq": mod_freq_coefs(n),
+          "amp": mod_amp_coefs(n),
+          "filter_type": 0}
+    if full:
+        kw["phase"] = "%.3f" % clamp(P["m%d_phase" % n], 0.0, 1.0)
+    amy.send(**kw)
+
+
+def build_voice(v, full=False):
+    """(Re)configure one voice.
+
+    full=True reallocates the synth, which resets every oscillator -- boot,
+    PANIC and patch load only.  A parameter change takes the cheap path and
+    never touches allocation, envelopes or phase, which is what keeps a knob
+    turn from clicking or re-triggering a held note."""
+    sy = VOICE_SYNTHS[v]
+    if full:
+        # Release first, exactly as the Megatron build does: reallocating a
+        # synth that still holds live voices is the kind of thing a C-level
+        # allocator handles badly when it is not expecting it.
+        amy.send(synth=sy, num_voices=0)
+        amy.send(synth=sy, num_voices=1, oscs_per_voice=OSCS_PER_VOICE, bus=BUS)
+        amy.send(synth=sy, synth_level=1.0)
+        # This sketch dispatches MIDI itself (channel filtering, voice modes,
+        # unison), so AMY must not also grab notes for these synths.
+        amy.send(synth=sy, grab_midi_notes=0)
+    # Order matters on a full build: the mod oscs must exist before anything
+    # names them as a mod_source, or the role assignment has nothing to mark.
+    _send_mod_osc(sy, 1, MOD1_OSC, full)
+    _send_mod_osc(sy, 2, MOD2_OSC, full)
+    _send_osc_wt(sy, v, "a", OSC_A, OSC_B, full)
+    _send_osc_wt(sy, v, "b", OSC_B, None, full)
+    _send_head(sy, v, full)
+
+
+def build_all(full=False):
+    for v in range(NVOICE):
+        build_voice(v, full)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 7 : TARGETED PARAMETER APPLICATION
+# --------------------------------------------------------------------------
+#  Every UI row names an apply GROUP, and each group resends only the handful
+#  of messages that its parameters can possibly affect.  This is the brief's
+#  "prevent parameter changes and UI activity from causing audio dropouts":
+#  turning CUTOFF sends 4 messages (one head per voice), not a rebuild of 20
+#  oscillators, and it never touches envelopes, phase or allocation -- so a
+#  held note keeps sustaining exactly as it was.
+
+def apply_osc_a():
+    for v in range(NVOICE):
+        _send_osc_wt(VOICE_SYNTHS[v], v, "a", OSC_A, OSC_B, False)
+
+
+def apply_osc_b():
+    for v in range(NVOICE):
+        _send_osc_wt(VOICE_SYNTHS[v], v, "b", OSC_B, None, False)
+
+
+def apply_head():
+    for v in range(NVOICE):
+        _send_head(VOICE_SYNTHS[v], v, False)
+
+
+def apply_mod1():
+    for v in range(NVOICE):
+        _send_mod_osc(VOICE_SYNTHS[v], 1, MOD1_OSC, False)
+
+
+def apply_mod2():
+    for v in range(NVOICE):
+        _send_mod_osc(VOICE_SYNTHS[v], 2, MOD2_OSC, False)
+
+
+def apply_matrix():
+    """A routing can reach any of the three scopes, so all three get resent."""
+    apply_osc_a()
+    apply_osc_b()
+    apply_head()
+
+
+def apply_unison():
+    """Detune / width / position spread are per-voice, so this is the one
+    group that genuinely differs voice to voice."""
+    apply_matrix()
+
+
+def apply_env():
+    """Envelopes are resent to every osc that owns one.
+
+    Deliberately NOT folded into the cheap path: bulk-resending breakpoints on
+    every knob turn is what made notes sustain forever in an earlier AMYboard
+    build, so envelopes move only when an envelope row is actually turned."""
+    ab = amp_bp()
+    m3 = mod3_bp()
+    m4 = mod4_bp()
+    for v in range(NVOICE):
+        sy = VOICE_SYNTHS[v]
+        for osc in (OSC_A, OSC_B):
+            amy.send(synth=sy, osc=osc, bp0=ab, bp1=m3,
+                     eg0_type=int(P["acurve"]), eg1_type=int(P["m3_curve"]))
+        amy.send(synth=sy, osc=HEAD, bp1=m4, eg1_type=int(P["m4_curve"]))
+
+
+def apply_fx():
+    """AMY's own bus effects.  All of it runs in AMY's C DSP -- the brief's
+    "use the built in AMY FX to save on cpu" -- so there is no custom C slot in
+    this synth at all, unlike the Megatron build's CHARACTER/Clouds pair."""
+    # Distortion runs FIRST in the bus chain, before EQ / chorus / echo /
+    # reverb (api.md).  At bus scope only the const term of a coef list is
+    # used, so these are plain numbers.
+    amy.send(bus=BUS, dist_clip=1 if P["d_clip"] else 0)
+    amy.send(bus=BUS, dist_fold=1 if P["d_fold"] else 0)
+    if int(P["d_bits"]) < 24 or int(P["d_rate"]) > 1:
+        amy.send(bus=BUS, dist_crush=[int(P["d_bits"]), int(P["d_rate"])])
+    else:
+        amy.send(bus=BUS, dist_crush="0")
+    amy.send(bus=BUS, dist_drive="%.3f" % clamp(P["d_drive"], 0.0625, 16.0))
+    amy.send(bus=BUS, dist_mix="%.3f" % clamp(P["d_mix"], 0.0, 1.0))
+    amy.send(bus=BUS, eq="%.2f,%.2f,%.2f" % (P["eq_l"], P["eq_m"], P["eq_h"]))
+    # chorus: level, max_delay (samples), lfo freq (Hz), depth
+    amy.send(bus=BUS, chorus="%.3f,%d,%.3f,%.3f"
+             % (P["ch_lvl"], int(P["ch_dly"]), P["ch_rate"], P["ch_dep"]))
+    # echo: level, delay_ms, max_delay_ms, feedback, filter_coef
+    # max_delay is fixed at the ceiling of the ECHO MS range: AMY allocates the
+    # echo line from it, so it must not shrink under a live delay time.
+    amy.send(bus=BUS, echo="%.3f,%d,%d,%.3f,%.3f"
+             % (P["ec_lvl"], int(P["ec_ms"]), 1000, P["ec_fb"], P["ec_tone"]))
+    # reverb: level, liveness, damping, xover Hz
+    amy.send(bus=BUS, reverb="%.3f,%.3f,%.3f,%.1f"
+             % (P["rv_lvl"], P["rv_live"], P["rv_damp"], P["rv_xover"]))
+
+
+def apply_sys():
+    amy.send(bus=BUS, volume=round(clamp(P["vol"], 0.0, 10.0), 3))
+    if int(P["panic"]):
+        P["panic"] = 0
+        panic()
+
+
+def apply_mode():
+    """Voice mode changed.
+
+    Nothing is allocated or freed -- the four synths already exist.  All that
+    changes is which voices get sent a note, plus a resend of the per-voice
+    coefficients, because detune / pan / position spread apply in UNISON and
+    collapse to zero in MONO and POLY."""
+    all_off()
+    apply_matrix()
+
+
+def apply_ab():
+    apply_osc_a()
+    apply_osc_b()
+
+
+def apply_rebuild():
+    """A full reallocation.  Cuts held notes, and is only reached by the few
+    controls that genuinely cannot take effect any other way -- PH.SYNC (AMY
+    has no command to un-set a trigger_phase) and the per-oscillator start
+    phases it arms."""
+    all_off()
+    build_all(full=True)
+
+
+def apply_none():
+    """Rows that only move UI state (the matrix cursor) or are serviced from
+    loop() (DRIFT).  Nothing to send."""
+    return
+
+
+APPLY = {
+    "a": apply_osc_a, "b": apply_osc_b, "head": apply_head,
+    "ab": apply_ab, "rebuild": apply_rebuild, "none": apply_none,
+    "m1": apply_mod1, "m2": apply_mod2, "mx": apply_matrix,
+    "env": apply_env, "fx": apply_fx, "sys": apply_sys,
+    "uni": apply_unison, "mode": apply_mode,
+}
+
+
+def apply_group(group):
+    fn = APPLY.get(group)
+    if fn:
+        try:
+            fn()
+        except Exception as e:
+            print("apply", group, "failed:", e)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 8 : VOICE ALLOCATION AND NOTE HANDLING
+# --------------------------------------------------------------------------
+#  Three modes, one allocator, zero AMY object churn between them.
+#
+#  A note is sent to a voice's HEAD ONLY.  AMY walks the chain from there and
+#  writes the note into OSC A and OSC B itself -- which is exactly why per-osc
+#  notes cannot be used for detune, and why every pitch offset lives in a freq
+#  coefficient instead.
+
+held = []                       # MIDI note stack, last-note priority (MONO)
+_vnote = [None] * NVOICE        # note currently sounding on each voice
+_vage = [0] * NVOICE            # allocation order, for stealing
+_alloc_clock = 0
+_cur_vel = 0.0
+
+
+def _voice_note_on(v, note, vel, retrigger=True):
+    sy = VOICE_SYNTHS[v]
+    n = clamp(note, 0, 127)
+    if retrigger:
+        # Retrigger the two mod oscillators' phase if asked.  This has to be a
+        # `phase` parameter message, not a note event: a mod-source osc ignores
+        # note events entirely (see the SECTION 5 note).
+        for n_mod, osc in ((1, MOD1_OSC), (2, MOD2_OSC)):
+            if P["m%d_trig" % n_mod]:
+                amy.send(synth=sy, osc=osc,
+                         phase="%.3f" % clamp(P["m%d_phase" % n_mod], 0.0, 1.0))
+        amy.send(synth=sy, osc=HEAD, note=round(n, 3), vel=round(vel, 4))
+    else:
+        # Pitch-only: portamento applies and nothing re-triggers.
+        amy.send(synth=sy, osc=HEAD, note=round(n, 3))
+    _vnote[v] = note
+
+
+def _voice_note_off(v):
+    if _vnote[v] is None:
+        return
+    amy.send(synth=VOICE_SYNTHS[v], osc=HEAD, vel=0)
+    _vnote[v] = None
+
+
+def _claim_voice(note):
+    """Pick a voice for a new POLY note.
+
+    Free voices first, then the OLDEST sounding one -- the conventional and
+    least surprising steal.  A note already sounding on a voice reuses that
+    voice, so a repeated note never doubles up."""
+    global _alloc_clock
+    _alloc_clock += 1
+    for v in range(NVOICE):
+        if _vnote[v] == note:
+            _vage[v] = _alloc_clock
+            return v
+    for v in range(NVOICE):
+        if _vnote[v] is None:
+            _vage[v] = _alloc_clock
+            return v
+    oldest, best = 0, _vage[0]
+    for v in range(1, NVOICE):
+        if _vage[v] < best:
+            oldest, best = v, _vage[v]
+    _voice_note_off(oldest)
+    _vage[oldest] = _alloc_clock
+    return oldest
+
+
+def note_on(note, vel):
+    global _cur_vel
+    _cur_vel = vel
+    mode = int(P["vmode"])
+    if note in held:
+        held.remove(note)
+    held.append(note)
+    if mode == VM_MONO:
+        # Legato: while another key is already down, glide to the new note
+        # without retriggering the envelopes.  With GLIDE at 0 that is an
+        # instant, click-free pitch change; above 0 it is portamento.
+        legato = len(held) > 1
+        _voice_note_on(0, note, vel, retrigger=not legato)
+    elif mode == VM_UNISON:
+        legato = len(held) > 1
+        for v in range(NVOICE):
+            _voice_note_on(v, note, vel, retrigger=not legato)
+    else:
+        v = _claim_voice(note)
+        _voice_note_on(v, note, vel, retrigger=True)
+
+
+def note_off(note):
+    mode = int(P["vmode"])
+    if note in held:
+        held.remove(note)
+    if mode == VM_POLY:
+        for v in range(NVOICE):
+            if _vnote[v] == note:
+                _voice_note_off(v)
+        return
+    voices = [0] if mode == VM_MONO else list(range(NVOICE))
+    if held:
+        # Fall back to the note still held underneath, without retriggering.
+        for v in voices:
+            _voice_note_on(v, held[-1], _cur_vel, retrigger=False)
+    else:
+        for v in voices:
+            _voice_note_off(v)
+
+
+def all_off():
+    del held[:]
+    for v in range(NVOICE):
+        _voice_note_off(v)
+
+
+def retune():
+    """Pitch-only refresh: detune / drift / mode changes land here.
+
+    Never retriggers, so a held unison stack can be detuned live."""
+    for v in range(NVOICE):
+        sy = VOICE_SYNTHS[v]
+        amy.send(synth=sy, osc=OSC_A, freq=osc_freq_coefs("a", v))
+        amy.send(synth=sy, osc=OSC_B, freq=osc_freq_coefs("b", v))
+
+
+def panic():
+    """The one place besides boot that is allowed to reset AMY."""
+    all_off()
+    amy.reset()
+    boot_amy()
+    build_all(full=True)
+    apply_fx()
+    apply_sys()
+
+
+# --------------------------------------------------------------------------
+#  SECTION 9 : PAGES  --  the parameter surface
+# --------------------------------------------------------------------------
+#  Row: (LABEL, key, lo, hi, step, kind, apply-group)
+#
+#  A page may hold FEWER than 8 rows but never MORE: on the eight-encoder board
+#  encoder N edits row N, so a 9th row would be physically unreachable.  boot()
+#  checks this and complains loudly rather than stranding a parameter.
+#
+#  kinds: 'f' float  'i' int  'e' enum  'ms' time  'hz' frequency
+#         'ct' cents  'a' momentary action  'wt' wavetable name
+MOD_SLOT_NAMES = ["MOD1", "MOD2", "MOD3", "MOD4"]
+
+ENUM_LISTS = {
+    "vmode": VOICE_MODES, "ftype": FILTERS,
+    "a_fold": ONOFF, "b_fold": ONOFF, "phsync": ONOFF,
+    "d_clip": ONOFF, "d_fold": ONOFF,
+    "m1_shape": LFO_SHAPES, "m2_shape": LFO_SHAPES,
+    "m1_mode": MOD_RATE_MODES, "m2_mode": MOD_RATE_MODES,
+    "m1_pol": POLARITY, "m2_pol": POLARITY,
+    "m3_pol": POLARITY, "m4_pol": POLARITY,
+    "m1_div": SYNC_DIVS, "m2_div": SYNC_DIVS,
+    "m1_trig": ONOFF, "m2_trig": ONOFF,
+    "acurve": EG_CURVES, "m3_curve": EG_CURVES, "m4_curve": EG_CURVES,
+    "mx_slot": MOD_SLOT_NAMES, "mx_dest": DEST_LABELS,
+}
+
+PAGES = [
+    ("OSC A", [
+        ("TABLE",  "a_wt",     0, 999,   1,    'wt', 'a'),
+        ("POSITION", "a_pos",  0.0, 1.0, 0.02, 'f',  'a'),
+        ("COARSE", "a_coarse", -24.0, 24.0, 1,  'i', 'a'),
+        ("FINE",   "a_fine",   -50.0, 50.0, 1,  'ct', 'a'),
+        ("LEVEL",  "a_lvl",    0.0, 1.0,  0.05, 'f', 'a'),
+        ("DRIVE",  "a_drv",    1.0, 16.0, 0.25, 'f', 'a'),
+        ("FOLD",   "a_fold",   0, 1,      1,    'e', 'a'),
+        ("PHASE",  "a_phase",  0.0, 1.0,  0.05, 'f', 'rebuild'),
+    ]),
+    ("OSC B", [
+        ("TABLE",  "b_wt",     0, 999,   1,    'wt', 'b'),
+        ("POSITION", "b_pos",  0.0, 1.0, 0.02, 'f',  'b'),
+        ("COARSE", "b_coarse", -24.0, 24.0, 1,  'i', 'b'),
+        ("FINE",   "b_fine",   -50.0, 50.0, 1,  'ct', 'b'),
+        ("LEVEL",  "b_lvl",    0.0, 1.0,  0.05, 'f', 'b'),
+        ("DRIVE",  "b_drv",    1.0, 16.0, 0.25, 'f', 'b'),
+        ("FOLD",   "b_fold",   0, 1,      1,    'e', 'b'),
+        ("PHASE",  "b_phase",  0.0, 1.0,  0.05, 'f', 'rebuild'),
+    ]),
+    ("MIX", [
+        ("VOICE",  "vmode",   0, 2,      1,    'e', 'mode'),
+        ("GLIDE",  "glide",   0.0, 2000.0, 10, 'ms', 'ab'),
+        ("VEL>AMP", "vsens",  0.0, 1.0,  0.05, 'f', 'ab'),
+        # PH.SYNC cannot be a live toggle: AMY has no wire command to UN-set an
+        # already-set trigger_phase, so turning it off needs fresh oscillators.
+        ("PH.SYNC", "phsync", 0, 1,      1,    'e', 'rebuild'),
+        ("BEND",   "bend",    0.0, 12.0, 1,    'f', 'sys'),
+        ("MIDI CH", "mch",    1, 16,     1,    'i', 'sys'),
+        ("VOLUME", "vol",     0.0, 8.0,  0.25, 'f', 'sys'),
+        ("PANIC",  "panic",   0, 1,      1,    'a', 'sys'),
+    ]),
+    ("FILTER", [
+        ("TYPE",   "ftype",   0, 6,      1,    'e', 'head'),
+        ("CUTOFF", "cutoff",  30.0, 12000.0, 0, 'hz', 'head'),
+        ("RESO",   "reso",    0.5, 16.0, 0.25, 'f', 'head'),
+        # This row IS the MOD4 -> CUTOFF routing (see mx_get/mx_set): the
+        # filter envelope and the fourth modulator are the same generator.
+        ("ENV AMT", "fenv",  -4.0, 4.0,  0.15, 'f', 'head'),
+        ("KBD TRK", "fkbd",   0.0, 1.0,  0.05, 'f', 'head'),
+        ("VEL",    "fvel",    0.0, 1.0,  0.05, 'f', 'head'),
+        ("DRIVE",  "fdrv",    1.0, 16.0, 0.25, 'f', 'head'),
+        ("MIX",    "fmix",    0.0, 1.0,  0.05, 'f', 'head'),
+    ]),
+    # The AMP envelope.  The FILTER envelope is not duplicated here: it IS
+    # MOD 4, which has its own full page (depth, curve, velocity, polarity),
+    # and the FILTER page's ENV AMT row is the MOD4 -> CUTOFF routing.  One
+    # generator, one place to edit it, no chance of two pages disagreeing.
+    ("ENV", [
+        ("AMP A",  "aa",  0.0, 4000.0, 10,   'ms', 'env'),
+        ("AMP D",  "ad",  1.0, 8000.0, 10,   'ms', 'env'),
+        ("AMP S",  "as",  0.0, 1.0,    0.05, 'f',  'env'),
+        ("AMP R",  "ar",  1.0, 8000.0, 10,   'ms', 'env'),
+        ("CURVE",  "acurve", 0, 3,     1,    'e',  'env'),
+    ]),
+    ("MOD 1", [
+        ("SHAPE",  "m1_shape", 0, 5,     1,    'e', 'm1'),
+        ("MODE",   "m1_mode",  0, 1,     1,    'e', 'm1'),
+        # RATE follows MODE: Hz as an LFO, harmonic ratio as an FM/RM operator.
+        # One row, because you only ever need one of the two (see eff_key()).
+        ("RATE",   "m1_rate",  0.01, 20.0, 0.05, 'f', 'm1'),
+        ("DEPTH",  "m1_depth", 0.0, 1.0,  0.05, 'f', 'm1'),
+        ("PHASE",  "m1_phase", 0.0, 1.0,  0.05, 'f', 'm1'),
+        ("SYNC",   "m1_div",   0, 7,      1,    'e', 'm1'),
+        ("POLARITY", "m1_pol", 0, 1,      1,    'e', 'mx'),
+        ("TRIG",   "m1_trig",  0, 1,      1,    'e', 'm1'),
+    ]),
+    ("MOD 2", [
+        ("SHAPE",  "m2_shape", 0, 5,     1,    'e', 'm2'),
+        ("MODE",   "m2_mode",  0, 1,     1,    'e', 'm2'),
+        ("RATE",   "m2_rate",  0.01, 20.0, 0.05, 'f', 'm2'),
+        ("DEPTH",  "m2_depth", 0.0, 1.0,  0.05, 'f', 'm2'),
+        ("PHASE",  "m2_phase", 0.0, 1.0,  0.05, 'f', 'm2'),
+        ("SYNC",   "m2_div",   0, 7,      1,    'e', 'm2'),
+        ("POLARITY", "m2_pol", 0, 1,      1,    'e', 'mx'),
+        ("TRIG",   "m2_trig",  0, 1,      1,    'e', 'm2'),
+    ]),
+    ("MOD 3", [
+        ("ATTACK", "m3_a",  0.0, 4000.0, 10,   'ms', 'env'),
+        ("DECAY",  "m3_d",  1.0, 8000.0, 10,   'ms', 'env'),
+        ("SUSTAIN", "m3_s", 0.0, 1.0,    0.05, 'f',  'env'),
+        ("RELEASE", "m3_r", 1.0, 8000.0, 10,   'ms', 'env'),
+        ("CURVE",  "m3_curve", 0, 3,     1,    'e',  'env'),
+        ("VEL",    "m3_vel", 0.0, 1.0,   0.05, 'f',  'mx'),
+        ("POLARITY", "m3_pol", 0, 1,     1,    'e',  'mx'),
+    ]),
+    ("MOD 4", [
+        ("ATTACK", "m4_a",  0.0, 4000.0, 10,   'ms', 'env'),
+        ("DECAY",  "m4_d",  1.0, 8000.0, 10,   'ms', 'env'),
+        ("SUSTAIN", "m4_s", 0.0, 1.0,    0.05, 'f',  'env'),
+        ("RELEASE", "m4_r", 1.0, 8000.0, 10,   'ms', 'env'),
+        ("CURVE",  "m4_curve", 0, 3,     1,    'e',  'env'),
+        ("VEL",    "m4_vel", 0.0, 1.0,   0.05, 'f',  'mx'),
+        ("POLARITY", "m4_pol", 0, 1,     1,    'e',  'mx'),
+    ]),
+    # The matrix is a 4 x 11 grid -- far more than eight encoders can hold, so
+    # it is edited as a cursor (SLOT + DEST) plus one AMOUNT, with the whole
+    # grid drawn live in the visual pane above.  Every routing is reachable and
+    # nothing is hidden.
+    ("MATRIX", [
+        ("SLOT",   "mx_slot", 0, NMOD - 1,        1, 'e', 'none'),
+        ("DEST",   "mx_dest", 0, len(DESTS) - 1,  1, 'e', 'none'),
+        ("AMOUNT", "mx_amt", -4.0, 4.0,        0.05, 'f', 'mx'),
+        ("CLEAR",  "mx_clr",  0, 1,               1, 'a', 'mx'),
+        ("CLR ALL", "mx_clrall", 0, 1,            1, 'a', 'mx'),
+    ]),
+    ("UNISON", [
+        ("DETUNE", "uni_det",   0.0, 50.0, 1,    'ct', 'uni'),
+        ("WIDTH",  "uni_width", 0.0, 1.0,  0.05, 'f',  'uni'),
+        ("POS SPR", "uni_pos",  0.0, 0.5,  0.02, 'f',  'uni'),
+        ("PH SPR", "uni_phase", 0.0, 1.0,  0.05, 'f',  'rebuild'),
+        ("DRIFT",  "uni_drift", 0.0, 1.0,  0.05, 'f',  'none'),
+    ]),
+    ("DRIVE", [
+        ("DRIVE",  "d_drive", 1.0, 16.0, 0.25, 'f', 'fx'),
+        ("CLIP",   "d_clip",  0, 1,      1,    'e', 'fx'),
+        ("FOLD",   "d_fold",  0, 1,      1,    'e', 'fx'),
+        ("BITS",   "d_bits",  1, 24,     1,    'i', 'fx'),
+        ("RATE",   "d_rate",  1, 32,     1,    'i', 'fx'),
+        ("MIX",    "d_mix",   0.0, 1.0,  0.05, 'f', 'fx'),
+    ]),
+    ("FX", [
+        ("CHORUS", "ch_lvl",  0.0, 1.0,  0.05, 'f', 'fx'),
+        ("CH DLY", "ch_dly",  1.0, 320.0, 10,  'i', 'fx'),
+        ("CH RATE", "ch_rate", 0.05, 8.0, 0.05, 'f', 'fx'),
+        ("CH DEPTH", "ch_dep", 0.0, 1.0, 0.05, 'f', 'fx'),
+        ("ECHO",   "ec_lvl",  0.0, 1.0,  0.05, 'f', 'fx'),
+        ("ECHO MS", "ec_ms",  20.0, 1000.0, 10, 'ms', 'fx'),
+        ("ECHO FB", "ec_fb",  0.0, 0.9,  0.05, 'f', 'fx'),
+        ("ECHO TONE", "ec_tone", -1.0, 1.0, 0.1, 'f', 'fx'),
+    ]),
+    ("REVERB", [
+        ("LEVEL",  "rv_lvl",   0.0, 1.0,  0.05, 'f', 'fx'),
+        ("LIVENESS", "rv_live", 0.0, 1.0, 0.02, 'f', 'fx'),
+        ("DAMPING", "rv_damp", 0.0, 1.0,  0.05, 'f', 'fx'),
+        ("XOVER",  "rv_xover", 200.0, 12000.0, 0, 'hz', 'fx'),
+        ("EQ LOW", "eq_l",   -15.0, 15.0, 1,    'f', 'fx'),
+        ("EQ MID", "eq_m",   -15.0, 15.0, 1,    'f', 'fx'),
+        ("EQ HIGH", "eq_h",  -15.0, 15.0, 1,    'f', 'fx'),
+        ("TEMPO",  "tempo",   40.0, 240.0, 1,   'f', 'm1'),
+    ]),
+]
+
+# 4-character grid labels, keyed by parameter so a control that appears on two
+# screens reads the same on both.
+SHORT = {
+    "a_wt": "TAB", "a_pos": "POS", "a_coarse": "CRS", "a_fine": "FINE",
+    "a_lvl": "LVL", "a_drv": "DRIV", "a_fold": "FOLD", "a_phase": "PHAS",
+    "b_wt": "TAB", "b_pos": "POS", "b_coarse": "CRS", "b_fine": "FINE",
+    "b_lvl": "LVL", "b_drv": "DRIV", "b_fold": "FOLD", "b_phase": "PHAS",
+    "vmode": "VOIC", "glide": "GLID", "vsens": "VSNS", "phsync": "SYNC",
+    "bend": "BEND", "mch": "MIDI", "vol": "VOL", "panic": "PNIC",
+    "ftype": "TYPE", "cutoff": "CUT", "reso": "RESO", "fenv": "ENV",
+    "fkbd": "KBD", "fvel": "VEL", "fdrv": "DRIV", "fmix": "MIX",
+    "aa": "A.A", "ad": "A.D", "as": "A.S", "ar": "A.R", "acurve": "CRV",
+    "m1_shape": "SHAP", "m1_mode": "MODE", "m1_rate": "RATE",
+    "m1_ratio": "RTIO", "m1_depth": "DEPT", "m1_phase": "PHAS",
+    "m1_div": "SYNC", "m1_pol": "POL", "m1_trig": "TRIG",
+    "m2_shape": "SHAP", "m2_mode": "MODE", "m2_rate": "RATE",
+    "m2_ratio": "RTIO", "m2_depth": "DEPT", "m2_phase": "PHAS",
+    "m2_div": "SYNC", "m2_pol": "POL", "m2_trig": "TRIG",
+    "m3_a": "A", "m3_d": "D", "m3_s": "S", "m3_r": "R",
+    "m3_curve": "CRV", "m3_vel": "VEL", "m3_pol": "POL",
+    "m4_a": "A", "m4_d": "D", "m4_s": "S", "m4_r": "R",
+    "m4_curve": "CRV", "m4_vel": "VEL", "m4_pol": "POL",
+    "mx_slot": "SLOT", "mx_dest": "DEST", "mx_amt": "AMT",
+    "mx_clr": "CLR", "mx_clrall": "CLRA",
+    "uni_det": "DTUN", "uni_width": "WIDE", "uni_pos": "P.SPR",
+    "uni_phase": "PH.S", "uni_drift": "DRFT",
+    "d_drive": "DRIV", "d_clip": "CLIP", "d_fold": "FOLD",
+    "d_bits": "BITS", "d_rate": "RATE", "d_mix": "MIX",
+    "ch_lvl": "CHOR", "ch_dly": "C.DLY", "ch_rate": "C.RT",
+    "ch_dep": "C.DP", "ec_lvl": "ECHO", "ec_ms": "E.MS",
+    "ec_fb": "E.FB", "ec_tone": "E.TN",
+    "rv_lvl": "REVB", "rv_live": "LIVE", "rv_damp": "DAMP",
+    "rv_xover": "XOVR", "eq_l": "EQ.L", "eq_m": "EQ.M", "eq_h": "EQ.H",
+    "tempo": "BPM",
+}
+
+
+def eff_key(key):
+    """The parameter a row actually edits right now.
+
+    Only the MOD RATE rows are context-sensitive: as an LFO the row is a rate
+    in Hz, and as an FM/RM operator it is a harmonic ratio.  They are different
+    parameters with different ranges, so the row switches which one it points
+    at rather than trying to be both at once."""
+    if key == "m1_rate" and P["m1_mode"] == 1:
+        return "m1_ratio"
+    if key == "m2_rate" and P["m2_mode"] == 1:
+        return "m2_ratio"
+    return key
+
+
+def eff_row(row):
+    """`row` with its key (and range/label) swapped for the effective one."""
+    label, key, lo, hi, step, kind, group = row
+    k = eff_key(key)
+    if k == key:
+        return row
+    return ("RATIO", k, 0.25, 16.0, 0.25, 'f', group)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 10 : VALUE FORMATTING AND EDITING
+# --------------------------------------------------------------------------
+
+def fmt_value(key, kind, v):
+    if kind == 'a':
+        return "GO"
+    if kind == 'wt':
+        return wt_name(v)
+    if kind == 'e':
+        lst = ENUM_LISTS.get(key)
+        if lst:
+            return lst[int(clamp(int(v), 0, len(lst) - 1))]
+        return str(int(v))
+    if kind == 'i':
+        return str(int(v))
+    if kind == 'ms':
+        if v >= 1000:
+            return "%.1fs" % (v / 1000.0)
+        return "%dms" % int(v)
+    if kind == 'hz':
+        if v >= 1000:
+            return "%.1fk" % (v / 1000.0)
+        return "%dHz" % int(v)
+    if kind == 'ct':
+        return "%dc" % int(v)
+    return "%.2f" % v
+
+
+def cell_value(key, kind, v):
+    """Compact 4-character value for a grid cell (the header shows it in full)."""
+    if kind == 'a':
+        return "GO"
+    if kind == 'wt':
+        return wt_name(v)[:4]
+    if kind == 'e':
+        lst = ENUM_LISTS.get(key)
+        if lst:
+            return lst[int(clamp(int(v), 0, len(lst) - 1))][:4]
+        return "%d" % int(v)
+    if kind in ('i', 'ct'):
+        return "%d" % int(v)
+    if kind == 'ms':
+        if v >= 1000:
+            return "%.1fs" % (v / 1000.0)
+        return "%d" % int(v)
+    if kind == 'hz':
+        if v >= 1000:
+            return "%.1fk" % (v / 1000.0)
+        return "%d" % int(v)
+    a = v if v >= 0 else -v
+    if a >= 10.0:
+        return "%d" % int(round(v))
+    if v < 0:
+        return "%.1f" % v
+    return "%.2f" % v
+
+
+def row_hi(row):
+    """A row's upper bound, resolved at read time.
+
+    Only the wavetable rows need this: the catalogue size is not known until
+    the SD card has been scanned, and it changes on a rescan."""
+    label, key, lo, hi, step, kind, group = row
+    if kind == 'wt':
+        return max(0, wt_count() - 1)
+    return hi
+
+
+def bump(row, delta):
+    """Move a parameter by `delta` encoder detents, and return its apply group."""
+    label, key, lo, hi, step, kind, group = eff_row(row)
+    if kind == 'wt':
+        hi = row_hi(row)
+    v = P[key]
+    if kind in ('e', 'i', 'a', 'wt'):
+        v = int(v) + delta
+    elif kind == 'hz':
+        # Exponential, so a knob feels right across 30 Hz .. 12 kHz.
+        v = float(v) * (1.06 ** delta)
+        if v < lo:
+            v = lo
+    elif kind == 'ms' and lo <= 0.0:
+        # A 0 ms attack has to stay reachable, so these step linearly at the
+        # bottom and exponentially once they are off zero.
+        v = float(v) + step * delta if v < 100.0 else float(v) * (1.06 ** delta)
+    elif kind == 'ms':
+        v = float(v) * (1.06 ** delta)
+        if v < lo:
+            v = lo
+    else:
+        v = float(v) + step * delta
+    P[key] = clamp(v, lo, hi)
+
+    # ---- rows that are windows onto something else -----------------------
+    if key in ("mx_slot", "mx_dest"):
+        # Moving the matrix cursor reloads AMOUNT from the routing it now
+        # points at, so the row always shows the live value.
+        P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
+        return 'none'
+    if key == "mx_amt":
+        slot, dest = int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])]
+        if not mod_can_reach(slot, dest):
+            # Not a reachable pair -- see MOD_SLOT_SCOPES.  Refuse rather than
+            # store a number that could never do anything.
+            P["mx_amt"] = 0.0
+            toast("NOT ROUTABLE")
+            return 'none'
+        mx_set(slot, dest, P["mx_amt"])
+        return 'mx'
+    if key in ("a_wt", "b_wt"):
+        wt_remember_selection()
+    return group
+
+
+def fire_action(key):
+    """Momentary rows ('a'): the click IS the value."""
+    if key == "panic":
+        P["panic"] = 0
+        panic()
+        toast("PANIC")
+    elif key == "mx_clr":
+        mx_set(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])], 0.0)
+        P["mx_amt"] = 0.0
+        apply_matrix()
+        toast("ROUTE CLEARED")
+    elif key == "mx_clrall":
+        MATRIX.clear()
+        P["fenv"] = 0.0
+        P["mx_amt"] = 0.0
+        apply_matrix()
+        toast("MATRIX CLEARED")
+    P[key] = 0
+
+
+# --------------------------------------------------------------------------
+#  SECTION 11 : PATCH MANAGEMENT
+# --------------------------------------------------------------------------
+#  A patch stores the P dict, the modulation matrix, and the two wavetables BY
+#  FILENAME -- never by catalogue index and never as embedded waveform data, as
+#  the brief requires.  That means a patch keeps working when the card gains or
+#  loses tables, and a missing table is reported rather than silently becoming
+#  whatever now sits at the old index.
+PATCH_FILE = "/user/wt_patches.json"
+PATCH_NAME_MAX = 12
+MAX_PATCHES = 24
+
+# Momentary actions and the matrix cursor are UI state, not sound: saving them
+# would fire a PANIC (or move somebody's cursor) on every load of that patch.
+PATCH_SKIP = ("panic", "mx_clr", "mx_clrall", "mx_slot", "mx_dest", "mx_amt")
+
+DEFAULTS = dict(P)
+DEFAULT_MATRIX = dict(MATRIX)
+
+
+def _capture_patch():
+    d = {}
+    for k in P:
+        if k not in PATCH_SKIP:
+            d[k] = P[k]
+    # The matrix is keyed by a (slot, dest) tuple, which JSON cannot represent,
+    # so it is flattened to "slot:dest" strings on the way out.
+    mx = {}
+    for (slot, dest), amt in MATRIX.items():
+        mx["%d:%s" % (slot, dest)] = amt
+    return {"p": d, "mx": mx,
+            "a_wt_path": _a_wt_path, "b_wt_path": _b_wt_path}
+
+
+def _apply_patch(rec):
+    """Load a patch snapshot into P/MATRIX and push it to AMY.
+
+    Every key is set, taking the saved value where there is one and the DEFAULT
+    where there is not.  Iterating only the saved keys would leave anything the
+    snapshot predates at whatever the last patch set it to -- load a heavily
+    driven patch, then one saved before DRIVE existed, and the drive comes
+    along with it.  That bug is why this loops over DEFAULTS."""
+    global _a_wt_path, _b_wt_path
+    if not isinstance(rec, dict):
+        return False
+    d = rec.get("p", {})
+    if not isinstance(d, dict):
+        return False
+    all_off()
+    for k in DEFAULTS:
+        if k in PATCH_SKIP:
+            continue
+        P[k] = d[k] if k in d else DEFAULTS[k]
+    P["panic"] = 0
+
+    MATRIX.clear()
+    mx = rec.get("mx", {})
+    if isinstance(mx, dict):
+        for k, amt in mx.items():
+            try:
+                slot_s, dest = k.split(":", 1)
+                slot = int(slot_s)
+            except Exception:
+                continue
+            if dest in DEST_IDS and 0 <= slot < NMOD and mod_can_reach(slot, dest):
+                MATRIX[(slot, dest)] = amt
+
+    # Wavetables come back by PATH.  Anything missing falls back to the first
+    # built-in and says so, rather than loading a different table in silence.
+    _a_wt_path = rec.get("a_wt_path")
+    _b_wt_path = rec.get("b_wt_path")
+    missing = False
+    for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
+        if path is None:
+            continue
+        i = wt_index_of_path(path)
+        if i >= 0:
+            P[key] = i
+        else:
+            P[key] = 0
+            missing = True
+    if missing:
+        toast("WT MISSING")
+
+    # A patch can change PH.SYNC and the per-osc start phases, neither of which
+    # can be un-set without fresh oscillators, so a load always takes the
+    # reallocating path.  It has already cut the notes above.
+    build_all(full=True)
+    apply_fx()
+    apply_sys()
+    P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
+    return True
+
+
+def _read_patches():
+    # The open() is kept separate from the parse: it is the only thing that
+    # tells "no file yet" apart from "file present but corrupt", and a
+    # transient read failure must not look like an empty library -- the next
+    # save would write that emptiness over a real one.
+    try:
+        f = open(PATCH_FILE)
+    except Exception:
+        return []
+    try:
+        d = json.load(f)
+    except Exception as e:
+        print("patches unreadable, leaving file alone:", e)
+        return []
+    finally:
+        f.close()
+    if isinstance(d, list):
+        return [q for q in d if isinstance(q, dict)
+                and isinstance(q.get("name"), str)
+                and isinstance(q.get("rec"), dict)]
+    return []
+
+
+_patches = _read_patches()
+_cur_patch = ""
+
+
+def _write_patches():
+    try:
+        with open(PATCH_FILE, "w") as f:
+            json.dump(_patches, f)
+        return True
+    except Exception as e:
+        print("patch write failed:", e)
+        return False
+
+
+def _find_patch(name):
+    for i in range(len(_patches)):
+        if _patches[i].get("name") == name:
+            return i
+    return -1
+
+
+def save_patch(name):
+    global _cur_patch
+    name = name.strip()
+    if not name:
+        return False
+    wt_remember_selection()
+    i = _find_patch(name)
+    if i >= 0:
+        _patches[i]["rec"] = _capture_patch()
+    else:
+        if len(_patches) >= MAX_PATCHES:
+            return False
+        _patches.append({"name": name, "rec": _capture_patch()})
+    _cur_patch = name
+    return _write_patches()
+
+
+def load_patch(name):
+    global _cur_patch
+    i = _find_patch(name)
+    if i < 0:
+        return False
+    if not _apply_patch(_patches[i]["rec"]):
+        return False
+    _cur_patch = name
+    return True
+
+
+def delete_patch(name):
+    global _cur_patch
+    i = _find_patch(name)
+    if i < 0:
+        return False
+    del _patches[i]
+    if _cur_patch == name:
+        _cur_patch = ""
+    return _write_patches()
+
+
+def rename_patch(old, new):
+    global _cur_patch
+    new = new.strip()
+    i = _find_patch(old)
+    if i < 0 or not new:
+        return False
+    if _find_patch(new) >= 0 and new != old:
+        return False
+    _patches[i]["name"] = new
+    if _cur_patch == old:
+        _cur_patch = new
+    return _write_patches()
+
+
+# --------------------------------------------------------------------------
+#  SECTION 12 : OLED / UI LAYER
+# --------------------------------------------------------------------------
+#  The grid, the colour discipline and the panel workaround are all carried
+#  over from the Megatron build, where they were verified on this hardware.
+#
+#  COLOURS ARE 0..15, NOT 0..255.  amyboard's Display forwards `col` straight
+#  through to framebuf: SSD1327 is GS4_HMSB (4 bits, masked to the low nibble)
+#  and SH1107 is MONO_VLSB (any non-zero is white).  Writing 0..255 scrambles
+#  the SSD1327 -- 200 & 15 == 8.  Where a distinction must survive the 1-bit
+#  panel it is carried by SHAPE, not brightness.
+C_BRIGHT   = 15
+C_VIS      = 14
+C_BAR_FILL = 13
+C_LABEL    = 7
+C_BAR_OUT  = 6
+C_TICK     = 5
+C_DIM      = 4
+C_PAGE_OFF = 1
+
+SCREEN_W = 128
+SCREEN_H = 128
+CHAR_W = 8
+CHAR_H = 8
+
+CAT_Y      = 1
+RULE1_Y    = 11
+FOCUS_Y    = 15
+VIS_Y0     = 24
+GRID_BOTTOM = 116
+STATUS_Y   = 107
+DOTS_Y     = 118
+GRID_COLS  = 4
+CELL_W     = SCREEN_W // GRID_COLS
+CELL_H     = 29
+BAR_W      = 26
+BAR_H      = 6
+TOAST_MS   = 1400
+
+#  OLED: SH1107 at 0x3D.  amyboard.init_display()'s autodetect binds the wrong
+#  driver here -- ssd1327_oled() is pinned to 0x3d and sh1107_oled() to 0x3c,
+#  Display() tries the SSD1327 first, and an SH1107 living at 0x3D ACKs that
+#  probe.  Nothing raises; it paints noise.  The fix is a TEMPORARY monkeypatch
+#  of amyboard's own constructors, then calling amyboard.init_display() as
+#  normal -- going through it is what wires up Display.__init__'s background
+#  I2C queue, which exists because AMY's audio thread polls the CV ADC on the
+#  same bus every audio block.  A hand-built driver would race it and garble.
+OLED_ADDR = 0x3D
+DISPLAY_ROTATION = 0
+DISPLAY_OK = False
+
+PATCH_PAGE = len(PAGES)
+N_PAGES = len(PAGES) + 1
+
+page = 0
+cursor = 0
+editing = False
+need_redraw = True
+page_mode = False
+_toast = ""
+_toast_t = 0
+enc = None
+n_enc = 0
+enc_last = [0] * 8
+btn_last = False
+btn_t = 0
+
+
+def _now():
+    return time.ticks_ms() if hasattr(time, "ticks_ms") else int(time.time() * 1000)
+
+
+def _dt(a, b):
+    return time.ticks_diff(a, b) if hasattr(time, "ticks_diff") else (a - b)
+
+
+def toast(msg):
+    global _toast, _toast_t, need_redraw
+    _toast = msg
+    _toast_t = _now()
+    need_redraw = True
+
+
+def need_ui():
+    global need_redraw
+    need_redraw = True
+
+
+def init_display():
+    global DISPLAY_OK
+    orig_sh = getattr(amyboard, "sh1107_oled", None)
+    orig_ssd = getattr(amyboard, "ssd1327_oled", None)
+    try:
+        def _sh1107_forced(rotate=0):
+            import sh1107
+            d = sh1107.SH1107_I2C(128, 128, amyboard.get_i2c(),
+                                  address=OLED_ADDR, rotate=DISPLAY_ROTATION)
+            d.sleep(False)
+            return d
+
+        def _ssd1327_disabled():
+            # Must RAISE, not return None: Display() keeps the first
+            # constructor that does not raise, so this is how the SSD1327
+            # branch is skipped and the SH1107 one reached.
+            raise OSError("ssd1327 disabled: panel is SH1107 at 0x%02X" % OLED_ADDR)
+
+        amyboard.sh1107_oled = _sh1107_forced
+        amyboard.ssd1327_oled = _ssd1327_disabled
+        amyboard.init_display()
+    except Exception as e:
+        print("init_display: failed (%s) -- retrying with autodetect" % e)
+        try:
+            amyboard.init_display()
+        except Exception as e2:
+            print("init_display: autodetect also failed:", e2)
+    finally:
+        if orig_sh is not None:
+            amyboard.sh1107_oled = orig_sh
+        if orig_ssd is not None:
+            amyboard.ssd1327_oled = orig_ssd
+    try:
+        DISPLAY_OK = amyboard.display is not None and amyboard.display.available
+    except Exception:
+        DISPLAY_OK = False
+    print("init_display: SH1107 at 0x%02X rot %d -- %s"
+          % (OLED_ADDR, DISPLAY_ROTATION, "OK" if DISPLAY_OK else "no panel"))
+    return DISPLAY_OK
+
+
+def display_refresh():
+    if DISPLAY_OK:
+        try:
+            amyboard.display_refresh()
+        except Exception as e:
+            print("display_refresh failed:", e)
+
+
+def is_patch_page():
+    return page == PATCH_PAGE
+
+
+def cur_rows():
+    if is_patch_page():
+        return []
+    return PAGES[page][1]
+
+
+def cell_norm(row):
+    """(fill 0..1, bipolar) for a row's bar."""
+    label, key, lo, hi, step, kind, group = eff_row(row)
+    if kind == 'wt':
+        hi = row_hi(row)
+    v = float(P[key])
+    if hi <= lo:
+        return 0.0, False
+    if kind in ('hz', 'ms') and lo > 0.0 and (hi / lo) > 20.0:
+        # Log fill, matching the exponential stepping these knobs use: on a
+        # linear bar a 30 Hz .. 12 kHz cutoff sits pinned at the far left for
+        # the whole musically useful part of its travel.
+        v = clamp(v, lo, hi)
+        return clamp((math.log(v) - math.log(lo))
+                     / (math.log(hi) - math.log(lo)), 0.0, 1.0), False
+    return clamp((v - lo) / (hi - lo), 0.0, 1.0), lo < 0.0
+
+
+def grid_y0(n_params):
+    n_rows = (max(1, n_params) + GRID_COLS - 1) // GRID_COLS
+    return GRID_BOTTOM - n_rows * CELL_H
+
+
+def cell_xy(i, n_params):
+    y0 = grid_y0(n_params)
+    return (i % GRID_COLS) * CELL_W, y0 + (i // GRID_COLS) * CELL_H
+
+
+def vis_band():
+    """(top_y, height) of the visual pane on the CURRENT page -- derived from
+    the grid, so a page with fewer rows automatically gets a taller picture."""
+    n = len(cur_rows())
+    return VIS_Y0, grid_y0(n) - VIS_Y0 - 2
+
+
+def draw_dots(d, y, cur, total):
+    w, h, off_w = 5, 2, 2
+    # Tighten the gap before giving up: 15 screens do not fit at a 4px pitch.
+    gap = 4
+    while gap > 1 and total * w + (total - 1) * gap > SCREEN_W:
+        gap -= 1
+    span = total * w + (total - 1) * gap
+    x = (SCREEN_W - span) // 2
+    if x < 0:
+        # More screens than fit at full pitch: fall back to a plain readout.
+        d.text("%d/%d" % (cur + 1, total), 2, y - 3, C_DIM)
+        return
+    for i in range(total):
+        if i == cur:
+            d.fill_rect(x, y, w, h, C_BRIGHT)
+        else:
+            d.fill_rect(x + (w - off_w) // 2, y, off_w, h, C_PAGE_OFF)
+        x += w + gap
+
+
+def draw_cell(d, x0, y0, label, val, n01, bip, state):
+    """state: 0 = idle, 1 = cursor, 2 = selected (being edited)."""
+    cx = x0 + CELL_W // 2
+    if state == 2:
+        d.fill_rect(x0, y0, CELL_W, CELL_H - 2, C_BRIGHT)
+        fg = bout = bfill = tick = 0
+    else:
+        fg, bout, bfill, tick = C_LABEL, C_BAR_OUT, C_BAR_FILL, C_TICK
+        if state == 1:
+            fg = bout = bfill = tick = C_BRIGHT
+            d.fill_rect(x0, y0 + CELL_H - 2, CELL_W, 1, C_BRIGHT)
+    lx = cx - (len(label) * CHAR_W) // 2
+    d.text(label, max(x0, lx), y0 + 2, fg)
+    vx = cx - (len(val) * CHAR_W) // 2
+    d.text(val, max(x0, vx), y0 + 11, fg)
+    bx = cx - BAR_W // 2
+    by = y0 + 20
+    d.fill_rect(bx, by, BAR_W, 1, bout)
+    d.fill_rect(bx, by + BAR_H - 1, BAR_W, 1, bout)
+    d.fill_rect(bx, by, 1, BAR_H, bout)
+    d.fill_rect(bx + BAR_W - 1, by, 1, BAR_H, bout)
+    if bip:
+        cb = bx + BAR_W // 2
+        d.fill_rect(cb, by, 1, BAR_H, tick)
+        half = (BAR_W - 4) // 2
+        w = int(round(half * (n01 - 0.5) * 2))
+        if w > 0:
+            d.fill_rect(cb, by + 2, w, BAR_H - 4, bfill)
+        elif w < 0:
+            d.fill_rect(cb + w, by + 2, -w, BAR_H - 4, bfill)
+    else:
+        fw = int(round((BAR_W - 4) * n01))
+        if fw > 0:
+            d.fill_rect(bx + 2, by + 2, fw, BAR_H - 4, bfill)
+
+
+# --------------------------------------------------------------------------
+#  VISUAL PANE
+# --------------------------------------------------------------------------
+#  Every page gets a picture of what its settings are doing.  Each one is
+#  self-contained (clears its own band, draws nothing else) and driven straight
+#  off P[...], redrawn only on the need_redraw path -- a knob turn or a cursor
+#  move -- so they cost nothing while you are just playing.  The MIX-page
+#  oscilloscope is the one exception: audio moves without any user input, so it
+#  gets its own throttled refresh from loop().
+SCOPE_NCHANS = 2                # AMY_NCHANS is 2 here; the buffer is interleaved
+_scope_fault = False
+
+# Stable pseudo-random offsets, -1..1.  A fixed TABLE rather than a live
+# random(), so a "scattered" picture holds still while a knob moves instead of
+# shimmering and reading as noise.
+VJIT = (0.31, -0.72, 0.55, -0.18, 0.88, -0.45, 0.12, -0.63)
+
+
+def _vrect(d, x, y, w, h, col, y_lo, y_hi):
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    if y < y_lo:
+        h -= (y_lo - y)
+        y = y_lo
+    if y + h > y_hi:
+        h = y_hi - y
+    if h <= 0 or w <= 0 or x >= SCREEN_W:
+        return
+    if x < 0:
+        w += x
+        x = 0
+    if x + w > SCREEN_W:
+        w = SCREEN_W - x
+    if w > 0:
+        d.fill_rect(x, y, w, h, col)
+
+
+def _vtrace(d, pts, col, y_lo, y_hi):
+    i = 1
+    while i < len(pts):
+        x0, y0 = pts[i - 1]
+        x1, y1 = pts[i]
+        y0 = clamp(y0, y_lo, y_hi - 1)
+        y1 = clamp(y1, y_lo, y_hi - 1)
+        d.line(int(x0), int(y0), int(x1), int(y1), col)
+        i += 1
+
+
+def draw_scope(d):
+    """Live post-FX output waveform, read straight off AMY's last-rendered
+    block (amy.get_output_buffer() -- src/api.c returns the exact bytes about
+    to reach the DAC, bus FX included, not a synthetic preview).
+
+    Touches only its own band: no d.fill(0), no full-screen redraw."""
+    global _scope_fault
+    y_top, h = vis_band()
+    d.fill_rect(0, y_top, SCREEN_W, h, 0)
+    try:
+        buf = amy.get_output_buffer()
+    except Exception as e:
+        if not _scope_fault:
+            _scope_fault = True
+            print("scope: amy.get_output_buffer() failed:", e)
+        buf = None
+    if not buf:
+        return
+    try:
+        samples = array.array('h', buf)
+    except Exception as e:
+        if not _scope_fault:
+            _scope_fault = True
+            print("scope: buffer decode failed:", e)
+        return
+    n = len(samples) // SCOPE_NCHANS
+    if n < 2:
+        return
+    mid = y_top + h // 2
+    half = h // 2 - 1
+    prev_y = mid
+    x = 0
+    step = max(1, n // SCREEN_W)
+    while x < SCREEN_W and x * step < n:
+        s = samples[(x * step) * SCOPE_NCHANS]      # left channel
+        y = clamp(mid - (s * half) // 32768, y_top, y_top + h - 1)
+        if x == 0:
+            d.pixel(x, y, C_VIS)
+        else:
+            d.line(x - 1, prev_y, x, y, C_VIS)
+        prev_y = y
+        x += 1
+
+
+def _adsr_widths(a_ms, d_ms, r_ms):
+    # Log-compressed, so a 5 ms attack next to an 8 s release each still get a
+    # visible sliver instead of one collapsing to nothing.
+    la = math.log(max(a_ms, 1.0) + 1.0)
+    ld = math.log(max(d_ms, 1.0) + 1.0)
+    lr = math.log(max(r_ms, 1.0) + 1.0)
+    total = la + ld + lr
+    if total <= 0.0:
+        total = 1.0
+    return la / total, ld / total, lr / total
+
+
+def draw_adsr(d, a_ms, d_ms, s_lvl, r_ms):
+    """Attack always rises to FULL peak -- matching AMY, where sustain is the
+    level decay falls TO, not the attack's target."""
+    y_top, h = vis_band()
+    d.fill_rect(0, y_top, SCREEN_W, h, 0)
+    x0, x1 = 2, SCREEN_W - 2
+    bot, top = y_top + h - 1, y_top
+    fa, fd, fr = _adsr_widths(a_ms, d_ms, r_ms)
+    w = x1 - x0
+    hold_w = max(4, int(w * 0.14))
+    remain = max(0, w - hold_w)
+    aw = max(3, int(remain * fa))
+    dw = max(3, int(remain * fd))
+    rw = max(3, remain - aw - dw)
+    sy = bot - int(round((bot - top) * clamp(s_lvl, 0.0, 1.0)))
+    xa = x0 + aw
+    xdc = xa + dw
+    xs = xdc + hold_w
+    d.line(x0, bot, xa, top, C_VIS)
+    d.line(xa, top, xdc, sy, C_VIS)
+    d.line(xdc, sy, xs, sy, C_VIS)
+    d.line(xs, sy, min(xs + rw, x1), bot, C_VIS)
+
+
+def draw_vis_wavetable(d, y0, h, which):
+    """The wavetable as a stack of cycles, with the scan position marked.
+
+    Eight slices stand in for the 64 cycles of a table; the bright one is where
+    POSITION currently sits, and the bracket around it shows how far the live
+    modulation swings it.  That swing is read from the same matrix the audio
+    uses, so the picture cannot drift out of step with the sound."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    pos = clamp(P[which + "_pos"], 0.0, 1.0)
+    # Total modulation reach on this destination, in position units.
+    swing = 0.0
+    for slot in range(NMOD):
+        amt = mx_get(slot, which + "_pos")
+        if amt:
+            off, coef = mod_terms(slot, amt, 'lin')
+            swing += abs(coef)
+    nsl = 8
+    slot_w = SCREEN_W // nsl
+    cur = int(clamp(pos * (nsl - 1) + 0.5, 0, nsl - 1))
+    for i in range(nsl):
+        # Each slice is a little waveform whose shape walks from a soft sine at
+        # the bottom of the table to a jagged one at the top -- a stand-in for
+        # "the table changes as you scan", not a render of the real file.
+        amp = (h // 2 - 3)
+        col = C_BRIGHT if i == cur else C_DIM
+        pts = []
+        for xx in range(0, slot_w - 2, 2):
+            ph = xx / float(max(1, slot_w - 2))
+            harm = 1.0 + i * 0.9
+            v = math.sin(2 * math.pi * ph) + (math.sin(2 * math.pi * harm * ph)
+                                              * (i / float(nsl)) * 0.8)
+            pts.append((i * slot_w + 1 + xx, y0 + h // 2 - v * amp * 0.5))
+        _vtrace(d, pts, col, y0, y_hi)
+    if swing > 0.0:
+        lo = int(clamp((pos - swing) * SCREEN_W, 0, SCREEN_W - 1))
+        hi = int(clamp((pos + swing) * SCREEN_W, 0, SCREEN_W - 1))
+        _vrect(d, lo, y_hi - 3, max(1, hi - lo), 2, C_VIS, y0, y_hi)
+    _vrect(d, int(pos * (SCREEN_W - 3)), y_hi - 5, 3, 4, C_BRIGHT, y0, y_hi)
+
+
+def draw_vis_filter(d, y0, h):
+    """Filter response.  x is log frequency over 20 Hz .. 20 kHz, so CUTOFF's
+    screen position matches the log-scaled CUT bar in the grid below.  A shape
+    that tracks the knobs, drawn cheaply -- not a measured plot."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    ftype = int(P["ftype"])
+    lo_l = math.log(20.0)
+    span_l = math.log(20000.0) - lo_l
+    oct_per_px = (span_l / math.log(2.0)) / float(SCREEN_W)
+    xc = (math.log(clamp(P["cutoff"], 20.0, 20000.0)) - lo_l) / span_l * SCREEN_W
+    reso_db = clamp((P["reso"] - 0.5) / 15.5, 0.0, 1.0) * 22.0
+    top_db, bot_db = 24.0, -48.0
+    pts = []
+    x = 0
+    while x < SCREEN_W:
+        dd = (x - xc) * oct_per_px
+        a = dd if dd >= 0 else -dd
+        if ftype == 0:
+            g = 0.0
+        elif ftype == 1:
+            g = 0.0 if dd < 0 else -12.0 * dd
+        elif ftype == 4:
+            g = 0.0 if dd < 0 else -24.0 * dd
+        elif ftype == 3:
+            g = 0.0 if dd > 0 else -12.0 * a
+        elif ftype == 2:
+            g = -9.0 * a
+        elif ftype == 5:
+            g = -34.0 / (1.0 + (a * 3.2) ** 2)
+        else:
+            g = -7.0 / (1.0 + (a * 2.2) ** 2) + 5.0 * math.sin(dd * 2.4)
+        if ftype not in (0, 5):
+            g += reso_db / (1.0 + (dd * 3.0) ** 2)
+        g = clamp(g, bot_db, top_db)
+        pts.append((x, y0 + (top_db - g) / (top_db - bot_db) * (h - 1)))
+        x += 2
+    _vtrace(d, pts, C_VIS, y0, y_hi)
+
+
+def draw_vis_lfo(d, y0, h, n):
+    """The modulator's own waveform.
+
+    In AUDIO mode it is drawn dense and labelled FM/RM, because at that rate it
+    is an operator rather than an LFO and the distinction is the whole point of
+    the MODE row."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    shape = int(clamp(P["m%d_shape" % n], 0, len(LFO_SHAPES) - 1))
+    depth = clamp(P["m%d_depth" % n], 0.0, 1.0)
+    audio = P["m%d_mode" % n] == 1
+    cycles = 6.0 if audio else clamp(mod_rate_hz(n) * 1.5, 0.5, 6.0)
+    ph0 = clamp(P["m%d_phase" % n], 0.0, 1.0)
+    mid = y0 + h // 2
+    amp = (h // 2 - 2) * depth
+    pts = []
+    for x in range(0, SCREEN_W, 2):
+        t = (x / float(SCREEN_W)) * cycles + ph0
+        f = t - int(t)
+        if shape == 0:
+            v = math.sin(2 * math.pi * t)
+        elif shape == 1:
+            v = 4.0 * abs(f - 0.5) - 1.0
+        elif shape == 2:
+            v = 1.0 - 2.0 * f
+        elif shape == 3:
+            v = 2.0 * f - 1.0
+        elif shape == 4:
+            v = 1.0 if f < 0.5 else -1.0
+        else:
+            v = VJIT[int(t) % len(VJIT)]
+        pts.append((x, mid - v * amp))
+    _vtrace(d, pts, C_VIS, y0, y_hi)
+    if audio:
+        d.text("FM/RM", SCREEN_W - 5 * CHAR_W - 1, y0, C_DIM)
+
+
+def draw_vis_matrix(d, y0, h):
+    """The whole 4 x 11 matrix at a glance.
+
+    Rows are the four modulators, columns the destinations.  A filled block is
+    a live routing (its height is the amount), a single dim pixel is a
+    reachable-but-unused pair, and a blank column for that row is a pair the
+    modulator physically cannot reach -- see MOD_SLOT_SCOPES.  The cursor cell
+    is bracketed."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    nd = len(DESTS)
+    cw = SCREEN_W // nd
+    rh = max(3, (h - 2) // NMOD)
+    cs, cd = int(P["mx_slot"]), int(P["mx_dest"])
+    for slot in range(NMOD):
+        ry = y0 + slot * rh
+        for di in range(nd):
+            dest = DEST_IDS[di]
+            x = di * cw
+            if not mod_can_reach(slot, dest):
+                continue
+            amt = mx_get(slot, dest)
+            if amt == 0.0:
+                d.pixel(x + cw // 2, ry + rh // 2, C_PAGE_OFF)
+            else:
+                mag = clamp(abs(amt) / 4.0, 0.12, 1.0)
+                bh = max(1, int((rh - 1) * mag))
+                _vrect(d, x + 1, ry + (rh - 1 - bh), max(1, cw - 2), bh,
+                       C_VIS, y0, y_hi)
+        if slot == cs:
+            _vrect(d, cd * cw, ry, 1, rh, C_BRIGHT, y0, y_hi)
+            _vrect(d, cd * cw + cw - 1, ry, 1, rh, C_BRIGHT, y0, y_hi)
+
+
+def draw_vis_unison(d, y0, h):
+    """Four voices, spread by DETUNE horizontally and WIDTH into the stereo
+    field -- exactly the two knobs on the page."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    sq = 7
+    for v in range(NVOICE):
+        cents = UNI_DETUNE[v] * P["uni_det"]
+        x = SCREEN_W / 2.0 + (cents / 50.0) * (SCREEN_W / 2.0 - sq)
+        pan = clamp(0.5 + UNI_PAN[v] * P["uni_width"] * 0.5, 0.0, 1.0)
+        y = y0 + 2 + (h - sq - 4) * pan
+        _vrect(d, x - sq / 2, y, sq, sq, C_VIS, y0, y_hi)
+    _vrect(d, SCREEN_W // 2, y0, 1, h, C_PAGE_OFF, y0, y_hi)
+
+
+def draw_vis_voices(d, y0, h):
+    """Which voices are sounding, and the mode that put them there."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    d.text(VOICE_MODES[int(P["vmode"])], 2, y0, C_DIM)
+    bw = SCREEN_W // NVOICE
+    for v in range(NVOICE):
+        x = v * bw + 4
+        y = y0 + 12
+        bh = max(4, h - 16)
+        if _vnote[v] is None:
+            _vrect(d, x, y + bh - 2, bw - 8, 2, C_PAGE_OFF, y0, y_hi)
+        else:
+            _vrect(d, x, y, bw - 8, bh, C_VIS, y0, y_hi)
+            d.text(str(int(_vnote[v])), x, y + bh // 2 - 4, 0)
+
+
+def draw_vis_drive(d, y0, h):
+    """The distortion transfer curve, clip and fold stages included."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    drive = clamp(P["d_drive"], 0.0625, 16.0)
+    pts = []
+    for x in range(0, SCREEN_W, 2):
+        v = (x / float(SCREEN_W)) * 2.0 - 1.0
+        y = v * drive
+        if P["d_fold"]:
+            for _ in range(4):
+                if y > 1.0:
+                    y = 2.0 - y
+                elif y < -1.0:
+                    y = -2.0 - y
+        if P["d_clip"] or not P["d_fold"]:
+            y = y - (y * y * y) / 3.0 if abs(y) < 1.0 else (1.0 if y > 0 else -1.0)
+        y = clamp(y * clamp(P["d_mix"], 0.0, 1.0), -1.0, 1.0)
+        pts.append((x, y0 + h / 2.0 - y * (h / 2.0 - 1)))
+    _vtrace(d, pts, C_VIS, y0, y_hi)
+
+
+def _bars(d, y0, h, items):
+    """A labelled bar per (name, 0..1) pair -- used by the two FX pages."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    n = len(items)
+    if n == 0:
+        return
+    rh = max(6, h // n)
+    for i in range(n):
+        name, v = items[i]
+        y = y0 + i * rh
+        d.text(name[:4], 1, y, C_DIM)
+        bx = 5 * CHAR_W
+        bw = SCREEN_W - bx - 3
+        _vrect(d, bx, y + 1, bw, rh - 3, C_PAGE_OFF, y0, y_hi)
+        _vrect(d, bx, y + 1, int(bw * clamp(v, 0.0, 1.0)), rh - 3, C_VIS, y0, y_hi)
+
+
+def draw_visual(d):
+    """Dispatch by page NAME, not index -- reordering PAGES cannot then point a
+    picture at the wrong screen."""
+    name = PAGES[page][0]
+    y0, h = vis_band()
+    if h < 8:
+        return
+    if name == "OSC A":
+        draw_vis_wavetable(d, y0, h, "a")
+    elif name == "OSC B":
+        draw_vis_wavetable(d, y0, h, "b")
+    elif name == "MIX":
+        # The output oscilloscope lives here: MIX is this synth's main page.
+        draw_scope(d)
+    elif name == "FILTER":
+        draw_vis_filter(d, y0, h)
+    elif name == "ENV":
+        draw_adsr(d, P["aa"], P["ad"], P["as"], P["ar"])
+    elif name == "MOD 1":
+        draw_vis_lfo(d, y0, h, 1)
+    elif name == "MOD 2":
+        draw_vis_lfo(d, y0, h, 2)
+    elif name == "MOD 3":
+        draw_adsr(d, P["m3_a"], P["m3_d"], P["m3_s"], P["m3_r"])
+    elif name == "MOD 4":
+        draw_adsr(d, P["m4_a"], P["m4_d"], P["m4_s"], P["m4_r"])
+    elif name == "MATRIX":
+        draw_vis_matrix(d, y0, h)
+    elif name == "UNISON":
+        draw_vis_unison(d, y0, h)
+    elif name == "DRIVE":
+        draw_vis_drive(d, y0, h)
+    elif name == "FX":
+        _bars(d, y0, h, [("CHOR", P["ch_lvl"]), ("ECHO", P["ec_lvl"]),
+                         ("FB", P["ec_fb"] / 0.9)])
+    elif name == "REVERB":
+        _bars(d, y0, h, [("REVB", P["rv_lvl"]), ("LIVE", P["rv_live"]),
+                         ("DAMP", P["rv_damp"])])
+
+
+# --------------------------------------------------------------------------
+#  PAGE CHROME
+# --------------------------------------------------------------------------
+
+def draw_page_header(d, title, right, right_col):
+    """In PAGE MODE the whole bar is knocked out -- an unmistakable "you are
+    picking a screen, this is not live yet", reusing the same knockout language
+    a selected grid cell already uses."""
+    if page_mode:
+        d.fill_rect(0, 0, SCREEN_W, RULE1_Y, C_BRIGHT)
+        d.text(title[:10], 2, CAT_Y, 0)
+        if right:
+            d.text(right, SCREEN_W - 2 - CHAR_W * len(right), CAT_Y, 0)
+    else:
+        d.text(title[:10], 2, CAT_Y, C_BRIGHT)
+        if right:
+            d.text(right, SCREEN_W - 2 - CHAR_W * len(right), CAT_Y, right_col)
+        d.fill_rect(0, RULE1_Y, SCREEN_W, 1, C_DIM)
+
+
+def draw_grid(d):
+    rows = cur_rows()
+    draw_page_header(d, PAGES[page][0], _cur_patch[:6] if _cur_patch else "",
+                     C_DIM)
+    if _toast and _dt(_now(), _toast_t) < TOAST_MS:
+        d.text(_toast[:16], 2, FOCUS_Y, C_BRIGHT)
+    elif 0 <= cursor < len(rows):
+        label, key, lo, hi, step, kind, group = eff_row(rows[cursor])
+        d.text(label[:9], 2, FOCUS_Y, C_LABEL)
+        v = fmt_value(key, kind, P[key])
+        d.text(v, SCREEN_W - 2 - CHAR_W * len(v), FOCUS_Y, C_BRIGHT)
+    draw_visual(d)
+    for i in range(len(rows)):
+        row = eff_row(rows[i])
+        label, key, lo, hi, step, kind, group = row
+        x0, y0 = cell_xy(i, len(rows))
+        n01, bip = cell_norm(rows[i])
+        state = 2 if (i == cursor and editing) else (1 if i == cursor else 0)
+        draw_cell(d, x0, y0, SHORT.get(key, label[:4]),
+                  cell_value(key, kind, P[key]), n01, bip, state)
+    draw_dots(d, DOTS_Y, page, N_PAGES)
+
+
+# --------------------------------------------------------------------------
+#  PATCH SCREEN -- a list, not a grid: it is the one screen whose contents
+#  change at runtime, and a name has to be typed rather than dialled.
+# --------------------------------------------------------------------------
+pmode = 'list'          # 'list' | 'menu' | 'name'
+plist_i = 0
+pmenu_i = 0
+_name_buf = ""
+_name_i = 0
+_rename_of = ""
+NAME_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_"
+PMENU = ["LOAD", "SAVE OVER", "RENAME", "DELETE"]
+
+
+def _plist_items():
+    """The patch list, with the two always-present actions on top."""
+    return ["<NEW PATCH>", "<RESCAN WT>"] + [q["name"] for q in _patches]
+
+
+def draw_patches(d):
+    draw_page_header(d, "PATCH", _cur_patch[:6] if _cur_patch else "", C_DIM)
+    if pmode == 'name':
+        d.text("NAME:", 2, FOCUS_Y, C_LABEL)
+        d.text(_name_buf[:12], 2, FOCUS_Y + 14, C_BRIGHT)
+        ch = NAME_CHARS[_name_i % len(NAME_CHARS)]
+        d.text("[" + ch + "]", 2, FOCUS_Y + 28, C_BRIGHT)
+        d.text("CLICK=ADD", 2, FOCUS_Y + 44, C_DIM)
+        d.text("HOLD=DONE", 2, FOCUS_Y + 56, C_DIM)
+        draw_dots(d, DOTS_Y, page, N_PAGES)
+        return
+    if pmode == 'menu':
+        d.text(_cur_sel_name()[:14], 2, FOCUS_Y, C_LABEL)
+        for i in range(len(PMENU)):
+            y = FOCUS_Y + 16 + i * 12
+            if i == pmenu_i:
+                d.fill_rect(0, y - 1, SCREEN_W, 11, C_BRIGHT)
+                d.text(PMENU[i], 4, y, 0)
+            else:
+                d.text(PMENU[i], 4, y, C_LABEL)
+        draw_dots(d, DOTS_Y, page, N_PAGES)
+        return
+    items = _plist_items()
+    if _toast and _dt(_now(), _toast_t) < TOAST_MS:
+        d.text(_toast[:16], 2, FOCUS_Y, C_BRIGHT)
+    else:
+        d.text("%d/%d" % (plist_i + 1, len(items)), 2, FOCUS_Y, C_DIM)
+    # A window of six around the cursor, so a long library still scrolls.
+    top = max(0, min(plist_i - 2, max(0, len(items) - 6)))
+    for k in range(6):
+        i = top + k
+        if i >= len(items):
+            break
+        y = VIS_Y0 + 4 + k * 13
+        if i == plist_i:
+            d.fill_rect(0, y - 1, SCREEN_W, 12, C_BRIGHT)
+            d.text(items[i][:15], 3, y, 0)
+        else:
+            d.text(items[i][:15], 3, y, C_LABEL)
+    draw_dots(d, DOTS_Y, page, N_PAGES)
+
+
+def _cur_sel_name():
+    items = _plist_items()
+    if 0 <= plist_i < len(items):
+        return items[plist_i]
+    return ""
+
+
+def patch_turn(delta):
+    global plist_i, pmenu_i, _name_i, need_redraw
+    if pmode == 'list':
+        n = len(_plist_items())
+        plist_i = int(clamp(plist_i + delta, 0, max(0, n - 1)))
+    elif pmode == 'menu':
+        pmenu_i = int(clamp(pmenu_i + delta, 0, len(PMENU) - 1))
+    else:
+        _name_i = (_name_i + delta) % len(NAME_CHARS)
+    need_redraw = True
+
+
+def _start_name(initial="", rename_of=""):
+    global pmode, _name_buf, _name_i, _rename_of, need_redraw
+    pmode = 'name'
+    _name_buf = initial
+    _name_i = 0
+    _rename_of = rename_of
+    need_redraw = True
+
+
+def _commit_name():
+    global pmode, need_redraw
+    name = _name_buf.strip()
+    if not name:
+        toast("NAME EMPTY")
+    elif _rename_of:
+        toast("RENAMED" if rename_patch(_rename_of, name) else "RENAME FAILED")
+    else:
+        toast("SAVED" if save_patch(name) else "SAVE FAILED")
+    pmode = 'list'
+    need_redraw = True
+
+
+def patch_click():
+    global pmode, pmenu_i, _name_buf, need_redraw
+    if pmode == 'name':
+        if len(_name_buf) < PATCH_NAME_MAX:
+            _name_buf += NAME_CHARS[_name_i % len(NAME_CHARS)]
+        need_redraw = True
+        return
+    if pmode == 'menu':
+        name = _cur_sel_name()
+        act = PMENU[pmenu_i]
+        if act == "LOAD":
+            toast("LOADED" if load_patch(name) else "LOAD FAILED")
+        elif act == "SAVE OVER":
+            toast("SAVED" if save_patch(name) else "SAVE FAILED")
+        elif act == "RENAME":
+            _start_name(name, rename_of=name)
+            return
+        elif act == "DELETE":
+            toast("DELETED" if delete_patch(name) else "DELETE FAILED")
+        pmode = 'list'
+        need_redraw = True
+        return
+    sel = _cur_sel_name()
+    if sel == "<NEW PATCH>":
+        _start_name("")
+    elif sel == "<RESCAN WT>":
+        n = wt_rescan()
+        apply_ab()
+        toast("%d TABLES" % n)
+    else:
+        pmode = 'menu'
+        pmenu_i = 0
+        need_redraw = True
+
+
+def patch_back():
+    global pmode, need_redraw
+    pmode = 'list'
+    need_redraw = True
+
+
+# --------------------------------------------------------------------------
+#  DRAW
+# --------------------------------------------------------------------------
+
+def draw():
+    global need_redraw
+    if not HAVE_BOARD or not DISPLAY_OK:
+        need_redraw = False
+        return
+    d = amyboard.display
+    try:
+        d.fill(0)
+        if is_patch_page():
+            draw_patches(d)
+        else:
+            draw_grid(d)
+        display_refresh()
+    except Exception as e:
+        print("draw failed:", e)
+    need_redraw = False
+
+
+def draw_splash(d):
+    d.fill(0)
+    d.text("AMYBOARD", 22, 34, C_BRIGHT)
+    d.text("WAVETABLE", 18, 48, C_BRIGHT)
+    d.text("4 VOICE / 8 OSC", 4, 68, C_DIM)
+    d.text("%d TABLES" % wt_count(), 30, 84, C_DIM)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 13 : INPUT
+# --------------------------------------------------------------------------
+#  encoder() and init_buttons() are called ONCE at boot, never inside the poll
+#  loop -- calling them again resets the state before we read it.
+
+def _goto_page(p):
+    global page, cursor, editing, need_redraw, pmode
+    page = p % N_PAGES
+    cursor = 0
+    editing = False
+    pmode = 'list'
+    if not is_patch_page() and PAGES[page][0] == "MATRIX":
+        # Land on the MATRIX page showing the routing the cursor points at,
+        # not a stale AMOUNT from the last time it was open.
+        P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
+    need_redraw = True
+
+
+def read_enc(i):
+    if enc is None:
+        return 0
+    try:
+        return enc.read(i)
+    except Exception:
+        return enc_last[i]
+
+
+def read_btn(i=0):
+    if enc is None:
+        return False
+    try:
+        return bool(enc.button(i))
+    except Exception:
+        return False
+
+
+def move_cursor(delta):
+    """Move within THIS screen only.  A screen is a screen; changing it is a
+    deliberate hold."""
+    global cursor, need_redraw
+    n = len(cur_rows())
+    if n:
+        cursor = int(clamp(cursor + delta, 0, n - 1))
+    need_redraw = True
+
+
+def edit_row(idx, delta):
+    global need_redraw
+    rows = cur_rows()
+    if idx < 0 or idx >= len(rows):
+        return
+    apply_group(bump(rows[idx], delta))
+    need_redraw = True
+
+
+def fire_action_row():
+    """Run the row under the cursor if it is an ACTION ('a') row.
+
+    Returns True if it fired, so the caller knows the click is spent.  Actions
+    fire on the click itself rather than the click-then-turn dance every other
+    row needs -- their value snaps back to 0 immediately, so on a single
+    encoder they would otherwise look completely inert."""
+    rows = cur_rows()
+    if cursor < 0 or cursor >= len(rows):
+        return False
+    row = rows[cursor]
+    if row[5] != 'a':
+        return False
+    fire_action(row[1])
+    need_ui()
+    return True
+
+
+def poll_input():
+    global editing, cursor, btn_last, btn_t, need_redraw
+    if enc is None:
+        return
+    on_patches = is_patch_page()
+
+    if page_mode:
+        # Screen picker: encoder 0 scrolls, everything else is inert so a stray
+        # nudge cannot edit the screen you are scrolling past.
+        pos = read_enc(0)
+        delta = pos - enc_last[0]
+        if delta != 0:
+            enc_last[0] = pos
+            _goto_page(page + delta)
+        # Keep the other baselines current, or the accumulated difference fires
+        # as one big edit the moment you land.
+        for i in range(1, 8):
+            enc_last[i] = read_enc(i)
+    elif n_enc >= 8 and not on_patches:
+        rows = cur_rows()
+        for i in range(8):
+            pos = read_enc(i)
+            delta = pos - enc_last[i]
+            if delta != 0:
+                enc_last[i] = pos
+                if i < len(rows):
+                    cursor = i
+                    edit_row(i, delta)
+    else:
+        pos = read_enc(0)
+        delta = pos - enc_last[0]
+        if delta != 0:
+            enc_last[0] = pos
+            if on_patches:
+                patch_turn(delta)
+            elif editing:
+                edit_row(cursor, delta)
+            else:
+                move_cursor(delta)
+
+    b = read_btn(0)
+    now = _now()
+    if b and not btn_last:
+        btn_t = now
+        btn_last = True
+    elif (not b) and btn_last:
+        btn_last = False
+        held_ms = _dt(now, btn_t)
+        if held_ms > 700:
+            if page_mode:
+                _exit_page_mode()
+            elif on_patches and pmode == 'name':
+                _commit_name()
+            elif on_patches and pmode != 'list':
+                patch_back()
+            else:
+                _enter_page_mode()
+        elif held_ms > 25:
+            if page_mode:
+                _exit_page_mode()
+            elif on_patches:
+                patch_click()
+            elif fire_action_row():
+                pass
+            elif n_enc >= 8:
+                # Nothing to do: all eight rows already have their own encoder,
+                # and screen changes go through page mode.
+                pass
+            else:
+                editing = not editing
+                need_redraw = True
+
+
+def _enter_page_mode():
+    global page_mode, editing, pmode, need_redraw
+    page_mode = True
+    editing = False
+    pmode = 'list'
+    need_redraw = True
+
+
+def _exit_page_mode():
+    global page_mode, need_redraw
+    page_mode = False
+    need_redraw = True
+
+
+# --------------------------------------------------------------------------
+#  SECTION 14 : MIDI
+# --------------------------------------------------------------------------
+_midi_chans_seen = set()
+
+
+def midi_cb(msg):
+    try:
+        if not msg:
+            return
+        st = msg[0]
+        if st < 0x80:
+            return
+        ch = (st & 0x0F) + 1
+        cmd = st & 0xF0
+        if ch != int(P["mch"]):
+            # A wrong channel is a silent drop by design -- but that silence
+            # looks identical to "MIDI isn't reaching this sketch at all" from
+            # the outside.  Print each distinct wrong channel ONCE (not per
+            # message), so a controller stuck on another channel shows up
+            # immediately instead of costing a debugging round trip.
+            if ch not in _midi_chans_seen:
+                _midi_chans_seen.add(ch)
+                print("midi: channel %d ignored -- this synth listens on %d "
+                      "(MIDI CH on the MIX page)" % (ch, int(P["mch"])))
+            return
+        if cmd == 0x90 and len(msg) > 2 and msg[2] > 0:
+            note_on(msg[1], msg[2] / 127.0)
+        elif cmd == 0x80 or (cmd == 0x90 and len(msg) > 2):
+            note_off(msg[1])
+        elif cmd == 0xB0 and len(msg) > 2:
+            cc, v = msg[1], msg[2] / 127.0
+            if cc == 74:                    # filter cutoff (standard)
+                P["cutoff"] = 30.0 + v * v * 11970.0
+                apply_head()
+            elif cc == 71:                  # resonance (standard)
+                P["reso"] = 0.5 + v * 15.5
+                apply_head()
+            elif cc == 1:                   # mod wheel -> OSC A/B position
+                P["a_pos"] = v
+                P["b_pos"] = v
+                apply_ab()
+            elif cc == 76:                  # the performance macro: unison detune
+                P["uni_det"] = v * 50.0
+                apply_unison()
+            elif cc == 123:
+                all_off()
+            need_ui()
+        elif cmd == 0xE0 and len(msg) > 2:
+            bend = ((msg[2] << 7) | msg[1]) - 8192
+            # Global: pitch_bend rides every osc's `bend` coefficient, which is
+            # why freq coefs always re-assert it.
+            amy.send(pitch_bend=round(bend / 8192.0 * P["bend"] / 12.0, 4))
+    except Exception as e:
+        print("midi_cb:", e)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 15 : ANALOGUE DRIFT
+# --------------------------------------------------------------------------
+#  A slow, continuous per-voice pitch wander, so a unison stack never sounds
+#  perfectly locked.  Each voice follows its own sine at a deliberately
+#  non-aligned rate: stepped random targets read as discrete little jumps,
+#  which is the wrong texture entirely.
+#
+#  This is the ONLY thing in the sketch that touches AMY from loop(), it runs
+#  at loop's own ~60 ms cadence (not audio rate), it sends at most 8 messages,
+#  and it is skipped outright when DRIFT is 0.
+DRIFT_RATES = [0.021, 0.034, 0.017, 0.028]
+DRIFT_PHASE0 = [0.00, 0.30, 0.60, 0.10]
+_drift_t = 0.0
+_drift_was_on = False
+
+
+def service_drift():
+    global _drift_t, _drift_was_on
+    amt = P["uni_drift"]
+    if amt <= 0.0:
+        if _drift_was_on:
+            # Settle back to nominal exactly once, rather than leaving the last
+            # wander baked into the tuning.
+            for v in range(NVOICE):
+                _drift_cents[v] = 0.0
+            retune()
+            _drift_was_on = False
+        return
+    _drift_was_on = True
+    _drift_t += 0.06
+    for v in range(NVOICE):
+        ph = DRIFT_PHASE0[v] + _drift_t * DRIFT_RATES[v]
+        _drift_cents[v] = math.sin(2.0 * math.pi * ph) * amt * 4.0
+    retune()
+
+
+# --------------------------------------------------------------------------
+#  SECTION 16 : DIAGNOSTICS  (REPL only -- never called from loop())
+# --------------------------------------------------------------------------
+
+def wt_selftest(note=60, ms=400):
+    """Is wave=WAVETABLE actually compiled into this firmware?
+
+    -DAMY_WAVETABLE is a build flag.  It is on in AMY's own Makefile and
+    setup.py, but the AMYboard firmware comes from the tulipcc tree, which this
+    sketch cannot inspect -- so this measures it instead of guessing: play a
+    note, read AMY's own rendered output back, and report the peak.  Near
+    silence with WT_ENABLED True means the flag is missing; set WT_ENABLED
+    False and everything else in the synth keeps working on a plain saw."""
+    print("wt_selftest: WT_ENABLED=%s, wave id %d, %d tables"
+          % (WT_ENABLED, W_WAVETABLE, wt_count()))
+    peak = 0
+    note_on(note, 1.0)
+    t0 = _now()
+    while _dt(_now(), t0) < ms:
+        try:
+            buf = amy.get_output_buffer()
+            if buf:
+                for s in array.array('h', buf):
+                    a = s if s >= 0 else -s
+                    if a > peak:
+                        peak = a
+        except Exception as e:
+            print("wt_selftest: output buffer unavailable:", e)
+            break
+        time.sleep(0.01)
+    note_off(note)
+    print("wt_selftest: peak %d / 32767 (%.1f%%)" % (peak, peak / 327.67))
+    if peak < 200:
+        print("  -> SILENT.  Either this firmware has no -DAMY_WAVETABLE, or")
+        print("     the selected table failed to load.  Try WT_ENABLED=False")
+        print("     (then run boot()) to confirm the rest of the synth works.")
+    else:
+        print("  -> wavetable oscillators are rendering.")
+    return peak
+
+
+def wt_list():
+    """Print the wavetable catalogue and which tables are resident in RAM."""
+    print("wavetable root:", WT_ROOT)
+    for i in range(len(WT_CATALOG)):
+        name, path, builtin = WT_CATALOG[i]
+        where = "builtin preset %d" % builtin if builtin is not None else path
+        live = ""
+        if path in _wt_slot_of:
+            live = "  [RAM preset %d]" % _wt_slot_of[path]
+        if path in _wt_failed:
+            live = "  [FAILED]"
+        print("  %2d  %-12s %s%s" % (i, name, where, live))
+    print("%d/%d RAM slots in use" % (len(_wt_slot_of), WT_SLOTS))
+
+
+def matrix_list():
+    """Print every live routing, as the audio path sees it."""
+    n = 0
+    for scope in ('a', 'b', 'h'):
+        for slot, dest, amt in mx_routings(scope):
+            off, coef = mod_terms(slot, amt, DEST_UNIT[dest])
+            print("  %s -> %-6s amt %+.2f  (coef %+.3f, const offset %+.3f, %s)"
+                  % (MOD_SLOT_NAMES[slot], dest, amt, coef, off,
+                     POLARITY[int(P["m%d_pol" % (slot + 1)])]))
+            n += 1
+    if n == 0:
+        print("  (no routings)")
+    return n
+
+
+def status():
+    print("mode      :", VOICE_MODES[int(P["vmode"])])
+    print("voices    :", _vnote)
+    print("tables    :", wt_name(P["a_wt"]), "/", wt_name(P["b_wt"]))
+    print("patch     :", _cur_patch or "(unsaved)")
+    try:
+        print("render load: %.0f%%" % (amy.render_load() * 100.0))
+    except Exception:
+        pass
+    matrix_list()
+
+
+def cpu_status():
+    try:
+        print("render load: %.1f%%" % (amy.render_load() * 100.0))
+    except Exception as e:
+        print("render_load unavailable:", e)
+
+
+def dsp(on=True):
+    """Mute/unmute without touching the patch -- for A/B-ing CPU load."""
+    amy.send(bus=BUS, volume=round(P["vol"], 3) if on else 0.0)
+
+
+# --------------------------------------------------------------------------
+#  SECTION 17 : BOOT AND MAIN LOOP
+# --------------------------------------------------------------------------
+
+def boot_amy():
+    """Bring AMY to a known state.  Called from boot() and from panic().
+
+    Every OTHER synth is zeroed first: AMY can bring up default demo
+    instruments at boot on several synth numbers -- including the ones this
+    sketch claims -- independently of anything we send.  A synth with
+    num_voices=0 cannot allocate a note, so this guarantees a clean slate."""
+    for s in range(17):
+        if s not in VOICE_SYNTHS:
+            amy.send(synth=s, num_voices=0)
+    amy.send(bus=BUS, volume=round(clamp(P["vol"], 0.0, 10.0), 3))
+
+
+def boot():
+    global enc, n_enc, need_redraw
+
+    # On the eight-encoder board encoder N edits row N, so a 9th row on any
+    # page would be invisible to the knobs.  Cheap to check, and it fails
+    # loudly at boot rather than silently stranding a parameter.
+    for _nm, _rows in PAGES:
+        if len(_rows) > 8:
+            print("WARNING: page", _nm, "has", len(_rows), "rows (max 8)")
+
+    amy.reset()                     # the one and only reset
+    boot_amy()
+
+    n = wt_scan()
+    print("wavetables: %d entries under %s" % (n, WT_ROOT))
+    wt_remember_selection()
+
+    try:
+        build_all(full=True)
+    except Exception as e:
+        print("build_all failed:", e)
+    try:
+        apply_fx()
+        apply_sys()
+    except Exception as e:
+        print("fx/sys failed:", e)
+
+    P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
+
+    if HAVE_BOARD:
+        # NEITHER of these was guarded in an earlier AMYboard sketch, and an
+        # exception in either aborted the whole of boot() -- which meant the
+        # encoder setup and the MIDI callback below never ran either, and
+        # `loop` never got defined: no display, no MIDI, no audio, all from one
+        # unguarded call.
+        try:
+            init_display()
+            if DISPLAY_OK:
+                draw_splash(amyboard.display)
+                display_refresh()
+                time.sleep(1.5)
+        except Exception as e:
+            print("display init failed:", e)
+        try:
+            enc = amyboard.encoder()
+            n_enc = getattr(enc, "encoders", 0)
+            for i in range(min(8, max(1, n_enc))):
+                enc_last[i] = enc.read(i)
+            print("encoders:", getattr(enc, "type", "?"), n_enc)
+        except Exception as e:
+            print("encoder init failed:", e)
+            enc = None
+
+    # MIDI -- add_callback, never tulip.midi_callback(), which replaces the
+    # system dispatcher and breaks everything else on the board.
+    if HAVE_MIDI:
+        try:
+            midimod.add_callback(midi_cb)
+        except Exception as e:
+            print("midi callback failed:", e)
+
+    print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
+          % (NVOICE, VOICE_SYNTHS))
+    print("REPL helpers: status()  wt_list()  wt_selftest()  matrix_list()")
+    need_redraw = True
+
+
+boot()
+
+_loop_fault = False
+_scope_t = 0
+SCOPE_MS = 90           # the scope's own refresh cadence, MIX page only
+
+
+def loop(*args):
+    """AMYboard calls this roughly every 60 ms.  Accept the optional step arg.
+
+    Nothing here is audio-rate.  The heaviest thing it can do is service_drift,
+    which sends at most 8 messages and only when DRIFT is turned up."""
+    global _loop_fault, _scope_t
+    try:
+        service_drift()
+        poll_input()
+        if need_redraw:
+            draw()
+        elif (HAVE_BOARD and DISPLAY_OK and not is_patch_page()
+              and PAGES[page][0] == "MIX"):
+            # The scope has to keep moving even when nothing changed --
+            # need_redraw only fires on USER input, and audio plays without
+            # any.  Throttled and self-contained (it clears and redraws only
+            # its own band), because bright OLED pixels couple noise into the
+            # audio path on this hardware.
+            now = _now()
+            if _dt(now, _scope_t) >= SCOPE_MS:
+                _scope_t = now
+                draw_scope(amyboard.display)
+                display_refresh()
+    except Exception as e:
+        # loop() runs every ~60 ms: print the real traceback once, then stay
+        # quiet, or a recurring fault floods the console and buries the one
+        # report that would explain it.
+        if not _loop_fault:
+            _loop_fault = True
+            print("loop failed:", e)
+            try:
+                import sys
+                sys.print_exception(e)
+            except Exception:
+                pass
