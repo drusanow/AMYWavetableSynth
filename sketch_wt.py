@@ -76,6 +76,75 @@ def clamp(v, lo, hi):
     return v
 
 
+# --------------------------------------------------------------------------
+#  RESILIENT AMY SEND  --  survive version skew between AMY builds
+# --------------------------------------------------------------------------
+#  The AMY on the web REPL, the AMYboard firmware and the desktop package are
+#  built from different snapshots, so a keyword one build knows another may
+#  reject outright: amy.message() raises "Unknown keyword X" the moment it sees
+#  one it does not have, and that aborts the WHOLE message.  That is exactly how
+#  a single unsupported `dist_clip` used to take the entire OSC A/B setup down
+#  with it -- leaving the oscillators as plain default sines, which is why
+#  changing the wavetable or its position "did nothing".
+#
+#  _amy_send() makes one unknown keyword cost only that keyword: it drops the
+#  rejected key and retries, so the wavetable, filter, envelopes and everything
+#  else in the same message still get through.  Each missing keyword is
+#  reported once.  The fast path (all keywords known) adds nothing but a
+#  try/except that never fires.
+_amy_unknown_kw = set()
+
+
+def _amy_send(**kw):
+    try:
+        amy.send(**kw)
+        return
+    except ValueError as e:
+        if "Unknown keyword" not in str(e):
+            raise
+    # Slow path: strip whatever this build does not understand, then retry.
+    while kw:
+        try:
+            amy.send(**kw)
+            return
+        except ValueError as e:
+            msg = str(e)
+            if "Unknown keyword" not in msg:
+                raise
+            bad = msg.rsplit(" ", 1)[-1].strip()
+            if bad not in kw:
+                print("amy: rejected send could not be repaired:", msg)
+                return
+            del kw[bad]
+            if bad not in _amy_unknown_kw:
+                _amy_unknown_kw.add(bad)
+                print("amy: this build has no '%s' -- that feature is skipped"
+                      % bad)
+
+
+def _amy_knows(kw):
+    """True if this AMY build accepts keyword `kw`.
+
+    Reads amy._KW_MAP (the send() vocabulary) when it is exposed -- present on
+    every build, just with different entries -- and falls back to a harmless
+    message() probe (which only builds a wire string, never sends) otherwise."""
+    m = getattr(amy, "_KW_MAP", None)
+    if isinstance(m, dict):
+        return kw in m
+    try:
+        amy.message(**{kw: 0})
+        return True
+    except Exception:
+        return False
+
+
+# Whether this AMY build has the per-osc / per-bus distortion block
+# (dist_clip / dist_fold / dist_crush / dist_drive / dist_mix).  Probed once in
+# boot(); assume present until then.  When False, the DRIVE/FOLD controls and
+# the DRIVE FX page simply do nothing rather than crashing the voice build.
+HAVE_DIST = True
+
+
 # =============================================================================
 #  AMY CAPABILITY NOTES  --  what the brief asked for vs what AMY actually has
 # =============================================================================
@@ -359,7 +428,10 @@ P = {
     # clamped away and the movement reads as half-depth.
     "a_wt": 0, "a_pos": 0.35, "a_coarse": 0.0, "a_fine": 0.0,
     "a_lvl": 0.8, "a_phase": 0.0, "a_drv": 1.0, "a_fold": 0,
-    "b_wt": 0, "b_pos": 0.5, "b_coarse": 0.0, "b_fine": 7.0,
+    # OSC B starts on a DIFFERENT built-in table (INT 1) and a slight detune,
+    # so the two-wavetable architecture is audible the moment you play a note
+    # rather than sounding like one oscillator.
+    "b_wt": 1, "b_pos": 0.5, "b_coarse": 0.0, "b_fine": 7.0,
     "b_lvl": 0.8, "b_phase": 0.25, "b_drv": 1.0, "b_fold": 0,
     # ---- mix / global ----------------------------------------------------
     "vmode": VM_UNISON, "glide": 0.0, "vsens": 0.4, "phsync": 1,
@@ -468,7 +540,7 @@ def mx_routings(scope):
 #    memory preset therefore SHADOWS a ROM one.
 #
 #    So: amy.load_sample("/sd/wavetables/user/foo.wav", preset=N) followed by
-#    amy.send(osc=..., wave=WAVETABLE, preset=N) plays an SD-card wavetable.
+#    _amy_send(osc=..., wave=WAVETABLE, preset=N) plays an SD-card wavetable.
 #    That is the entire mechanism, and it needs no firmware change.
 #
 #  TWO CONSTRAINTS THAT FALL OUT OF THE SAME CODE, AND ARE OBEYED HERE:
@@ -1163,11 +1235,12 @@ def _send_osc_wt(sy, v, which, osc, chain_to, full):
     # The oscillators never filter their own slice -- that would happen BEFORE
     # the sum reaches the head, i.e. the filter would run twice.
     kw["filter_type"] = 0
-    on = _stage_needed(which, which + "_drv", which + "_fold")
-    kw["dist_clip"] = 1 if on else 0
-    kw["dist_fold"] = 1 if (on and P[which + "_fold"]) else 0
-    if on:
-        kw["dist_drive"] = osc_drive_coefs(which)
+    if HAVE_DIST:
+        on = _stage_needed(which, which + "_drv", which + "_fold")
+        kw["dist_clip"] = 1 if on else 0
+        kw["dist_fold"] = 1 if (on and P[which + "_fold"]) else 0
+        if on:
+            kw["dist_drive"] = osc_drive_coefs(which)
     if full:
         kw["bp0"] = amp_bp()            # eg0 = amp envelope
         kw["bp1"] = mod3_bp()           # eg1 = MOD3, the free assignable envelope
@@ -1178,7 +1251,7 @@ def _send_osc_wt(sy, v, which, osc, chain_to, full):
         # knob turn clicks every held note.
         if P["phsync"]:
             kw["phase"] = "%.3f" % voice_phase(v, P[which + "_phase"])
-    amy.send(**kw)
+    _amy_send(**kw)
 
 
 def _send_head(sy, v, full):
@@ -1200,15 +1273,17 @@ def _send_head(sy, v, full):
           "resonance": round(clamp(P["reso"], 0.5, 16.0), 3),
           "filter_freq": head_filter_coefs(),
           "portamento": int(P["glide"])}
-    hon = P["fdrv"] > 1.001 or any(mx_get(s, "f_drv") != 0.0 for s in range(NMOD))
-    kw["dist_clip"] = 1 if hon else 0
-    if hon:
-        kw["dist_drive"] = head_drive_coefs()
-        kw["dist_mix"] = "%.3f" % clamp(P["fmix"], 0.0, 1.0)
+    if HAVE_DIST:
+        hon = P["fdrv"] > 1.001 or any(mx_get(s, "f_drv") != 0.0
+                                       for s in range(NMOD))
+        kw["dist_clip"] = 1 if hon else 0
+        if hon:
+            kw["dist_drive"] = head_drive_coefs()
+            kw["dist_mix"] = "%.3f" % clamp(P["fmix"], 0.0, 1.0)
     if full:
         kw["bp1"] = mod4_bp()           # eg1 = MOD4 = the filter envelope
         kw["eg1_type"] = int(P["m4_curve"])
-    amy.send(**kw)
+    _amy_send(**kw)
 
 
 def _send_mod_osc(sy, n, osc, full):
@@ -1219,7 +1294,7 @@ def _send_mod_osc(sy, n, osc, full):
           "filter_type": 0}
     if full:
         kw["phase"] = "%.3f" % clamp(P["m%d_phase" % n], 0.0, 1.0)
-    amy.send(**kw)
+    _amy_send(**kw)
 
 
 def build_voice(v, full=False):
@@ -1234,12 +1309,12 @@ def build_voice(v, full=False):
         # Release first, exactly as the Megatron build does: reallocating a
         # synth that still holds live voices is the kind of thing a C-level
         # allocator handles badly when it is not expecting it.
-        amy.send(synth=sy, num_voices=0)
-        amy.send(synth=sy, num_voices=1, oscs_per_voice=OSCS_PER_VOICE, bus=BUS)
-        amy.send(synth=sy, synth_level=1.0)
+        _amy_send(synth=sy, num_voices=0)
+        _amy_send(synth=sy, num_voices=1, oscs_per_voice=OSCS_PER_VOICE, bus=BUS)
+        _amy_send(synth=sy, synth_level=1.0)
         # This sketch dispatches MIDI itself (channel filtering, voice modes,
         # unison), so AMY must not also grab notes for these synths.
-        amy.send(synth=sy, grab_midi_notes=0)
+        _amy_send(synth=sy, grab_midi_notes=0)
     # Order matters on a full build: the mod oscs must exist before anything
     # names them as a mod_source, or the role assignment has nothing to mark.
     _send_mod_osc(sy, 1, MOD1_OSC, full)
@@ -1314,9 +1389,9 @@ def apply_env():
     for v in range(NVOICE):
         sy = VOICE_SYNTHS[v]
         for osc in (OSC_A, OSC_B):
-            amy.send(synth=sy, osc=osc, bp0=ab, bp1=m3,
+            _amy_send(synth=sy, osc=osc, bp0=ab, bp1=m3,
                      eg0_type=int(P["acurve"]), eg1_type=int(P["m3_curve"]))
-        amy.send(synth=sy, osc=HEAD, bp1=m4, eg1_type=int(P["m4_curve"]))
+        _amy_send(synth=sy, osc=HEAD, bp1=m4, eg1_type=int(P["m4_curve"]))
 
 
 def apply_fx():
@@ -1325,31 +1400,33 @@ def apply_fx():
     this synth at all, unlike the Megatron build's CHARACTER/Clouds pair."""
     # Distortion runs FIRST in the bus chain, before EQ / chorus / echo /
     # reverb (api.md).  At bus scope only the const term of a coef list is
-    # used, so these are plain numbers.
-    amy.send(bus=BUS, dist_clip=1 if P["d_clip"] else 0)
-    amy.send(bus=BUS, dist_fold=1 if P["d_fold"] else 0)
-    if int(P["d_bits"]) < 24 or int(P["d_rate"]) > 1:
-        amy.send(bus=BUS, dist_crush=[int(P["d_bits"]), int(P["d_rate"])])
-    else:
-        amy.send(bus=BUS, dist_crush="0")
-    amy.send(bus=BUS, dist_drive="%.3f" % clamp(P["d_drive"], 0.0625, 16.0))
-    amy.send(bus=BUS, dist_mix="%.3f" % clamp(P["d_mix"], 0.0, 1.0))
-    amy.send(bus=BUS, eq="%.2f,%.2f,%.2f" % (P["eq_l"], P["eq_m"], P["eq_h"]))
+    # used, so these are plain numbers.  Only if this AMY build has it -- the
+    # DRIVE page is otherwise inert rather than crashing the send.
+    if HAVE_DIST:
+        _amy_send(bus=BUS, dist_clip=1 if P["d_clip"] else 0)
+        _amy_send(bus=BUS, dist_fold=1 if P["d_fold"] else 0)
+        if int(P["d_bits"]) < 24 or int(P["d_rate"]) > 1:
+            _amy_send(bus=BUS, dist_crush=[int(P["d_bits"]), int(P["d_rate"])])
+        else:
+            _amy_send(bus=BUS, dist_crush="0")
+        _amy_send(bus=BUS, dist_drive="%.3f" % clamp(P["d_drive"], 0.0625, 16.0))
+        _amy_send(bus=BUS, dist_mix="%.3f" % clamp(P["d_mix"], 0.0, 1.0))
+    _amy_send(bus=BUS, eq="%.2f,%.2f,%.2f" % (P["eq_l"], P["eq_m"], P["eq_h"]))
     # chorus: level, max_delay (samples), lfo freq (Hz), depth
-    amy.send(bus=BUS, chorus="%.3f,%d,%.3f,%.3f"
+    _amy_send(bus=BUS, chorus="%.3f,%d,%.3f,%.3f"
              % (P["ch_lvl"], int(P["ch_dly"]), P["ch_rate"], P["ch_dep"]))
     # echo: level, delay_ms, max_delay_ms, feedback, filter_coef
     # max_delay is fixed at the ceiling of the ECHO MS range: AMY allocates the
     # echo line from it, so it must not shrink under a live delay time.
-    amy.send(bus=BUS, echo="%.3f,%d,%d,%.3f,%.3f"
+    _amy_send(bus=BUS, echo="%.3f,%d,%d,%.3f,%.3f"
              % (P["ec_lvl"], int(P["ec_ms"]), 1000, P["ec_fb"], P["ec_tone"]))
     # reverb: level, liveness, damping, xover Hz
-    amy.send(bus=BUS, reverb="%.3f,%.3f,%.3f,%.1f"
+    _amy_send(bus=BUS, reverb="%.3f,%.3f,%.3f,%.1f"
              % (P["rv_lvl"], P["rv_live"], P["rv_damp"], P["rv_xover"]))
 
 
 def apply_sys():
-    amy.send(bus=BUS, volume=round(clamp(P["vol"], 0.0, 10.0), 3))
+    _amy_send(bus=BUS, volume=round(clamp(P["vol"], 0.0, 10.0), 3))
     if int(P["panic"]):
         P["panic"] = 0
         panic()
@@ -1430,19 +1507,19 @@ def _voice_note_on(v, note, vel, retrigger=True):
         # note events entirely (see the SECTION 5 note).
         for n_mod, osc in ((1, MOD1_OSC), (2, MOD2_OSC)):
             if P["m%d_trig" % n_mod]:
-                amy.send(synth=sy, osc=osc,
+                _amy_send(synth=sy, osc=osc,
                          phase="%.3f" % clamp(P["m%d_phase" % n_mod], 0.0, 1.0))
-        amy.send(synth=sy, osc=HEAD, note=round(n, 3), vel=round(vel, 4))
+        _amy_send(synth=sy, osc=HEAD, note=round(n, 3), vel=round(vel, 4))
     else:
         # Pitch-only: portamento applies and nothing re-triggers.
-        amy.send(synth=sy, osc=HEAD, note=round(n, 3))
+        _amy_send(synth=sy, osc=HEAD, note=round(n, 3))
     _vnote[v] = note
 
 
 def _voice_note_off(v):
     if _vnote[v] is None:
         return
-    amy.send(synth=VOICE_SYNTHS[v], osc=HEAD, vel=0)
+    _amy_send(synth=VOICE_SYNTHS[v], osc=HEAD, vel=0)
     _vnote[v] = None
 
 
@@ -1524,8 +1601,8 @@ def retune():
     Never retriggers, so a held unison stack can be detuned live."""
     for v in range(NVOICE):
         sy = VOICE_SYNTHS[v]
-        amy.send(synth=sy, osc=OSC_A, freq=osc_freq_coefs("a", v))
-        amy.send(synth=sy, osc=OSC_B, freq=osc_freq_coefs("b", v))
+        _amy_send(synth=sy, osc=OSC_A, freq=osc_freq_coefs("a", v))
+        _amy_send(synth=sy, osc=OSC_B, freq=osc_freq_coefs("b", v))
 
 
 def panic():
@@ -3247,7 +3324,7 @@ def midi_cb(msg):
             bend = ((msg[2] << 7) | msg[1]) - 8192
             # Global: pitch_bend rides every osc's `bend` coefficient, which is
             # why freq coefs always re-assert it.
-            amy.send(pitch_bend=round(bend / 8192.0 * P["bend"] / 12.0, 4))
+            _amy_send(pitch_bend=round(bend / 8192.0 * P["bend"] / 12.0, 4))
     except Exception as e:
         print("midi_cb:", e)
 
@@ -3394,7 +3471,7 @@ def cpu_status():
 
 def dsp(on=True):
     """Mute/unmute without touching the patch -- for A/B-ing CPU load."""
-    amy.send(bus=BUS, volume=round(P["vol"], 3) if on else 0.0)
+    _amy_send(bus=BUS, volume=round(P["vol"], 3) if on else 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -3410,12 +3487,12 @@ def boot_amy():
     num_voices=0 cannot allocate a note, so this guarantees a clean slate."""
     for s in range(17):
         if s not in VOICE_SYNTHS:
-            amy.send(synth=s, num_voices=0)
-    amy.send(bus=BUS, volume=round(clamp(P["vol"], 0.0, 10.0), 3))
+            _amy_send(synth=s, num_voices=0)
+    _amy_send(bus=BUS, volume=round(clamp(P["vol"], 0.0, 10.0), 3))
 
 
 def boot():
-    global enc, n_enc, need_redraw
+    global enc, n_enc, need_redraw, HAVE_DIST
 
     # On the eight-encoder board encoder N edits row N, so a 9th row on any
     # page would be invisible to the knobs.  Cheap to check, and it fails
@@ -3426,6 +3503,17 @@ def boot():
 
     amy.reset()                     # the one and only reset
     boot_amy()
+
+    # Probe this AMY build's vocabulary ONCE.  The web REPL, the AMYboard
+    # firmware and the desktop package are built from different snapshots; the
+    # per-osc/bus distortion block is the newest thing this synth uses, so it
+    # is the one most likely to be absent.  Skipping it up front keeps the
+    # DRIVE/FOLD controls inert instead of crashing every voice build with
+    # "Unknown keyword dist_clip".
+    HAVE_DIST = _amy_knows("dist_clip")
+    print("AMY %s -- distortion FX %s"
+          % (getattr(amy, "version", "?"),
+             "available" if HAVE_DIST else "NOT in this build (DRIVE/FOLD off)"))
 
     # STARTUP CONTRACT: built-in tables only, no SD access.  The card is read
     # only later, on demand, from the WT LOAD page or when a patch names a

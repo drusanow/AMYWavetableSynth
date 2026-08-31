@@ -70,6 +70,24 @@ Near-silence means the flag is missing — set `WT_ENABLED = False` and re-run
 `boot()`; the two oscillators fall back to a saw and everything else (filter,
 envelopes, matrix, unison, FX) keeps working.
 
+### Version differences between AMY builds
+
+The web REPL, the AMYboard firmware and the desktop package are built from
+different AMY snapshots, so one build may not know a keyword another does. All
+`amy.send`s go through a resilient wrapper: a keyword this build doesn't
+recognise is dropped (reported once) instead of taking the whole message —
+and its oscillator — down with it. The newest feature the synth uses is the
+per-oscillator/bus **distortion** block (`dist_*`); it's probed once at boot,
+and if it's absent the `DRIVE`/`FOLD` controls simply do nothing. Boot prints a
+line telling you which build you're on, e.g.:
+
+```
+AMY 1.2.162 -- distortion FX available
+```
+
+(An older build prints `distortion FX NOT in this build (DRIVE/FOLD off)` — the
+synth is otherwise fully functional.)
+
 ## Voice modes
 
 Four **separate AMY synths**, one per voice — not one synth with four voices.
