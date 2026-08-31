@@ -576,7 +576,14 @@ WT_SLOTS = 4                    # 4 x 32 KB worst case; a patch only needs 2
 WT_BUILTIN_BASE = 19
 WT_BUILTIN_COUNT = 5
 
-WT_DIRS = ("factory", "user")   # under WT_ROOT, per the brief's layout
+# The SD card is scanned RECURSIVELY from its mount root, wherever the user
+# put their files -- not a fixed /wavetables/{factory,user} layout, which was
+# the reason the browser showed nothing.  Bounded so a huge card cannot hang
+# the scan.  Dot-files and the usual OS metadata folders are skipped.
+SD_SCAN_MAX_DEPTH = 5
+SD_SCAN_MAX_FILES = 250
+_SD_SKIP = ("System Volume Information", ".Spotlight-V100", ".Trashes",
+            ".fseventsd", "__MACOSX", ".git")
 
 # STARTUP CONTRACT: the synth ALWAYS boots on the built-in tables (INT 0..4)
 # and never reads the SD card on its own -- a missing, slow or unformatted card
@@ -588,28 +595,58 @@ WT_DIRS = ("factory", "user")   # under WT_ROOT, per the brief's layout
 # and an unusable one is caught at load time rather than being pre-filtered.
 
 
-def _sd_root():
-    """Where the SD card is mounted.
+def _sd_card_root():
+    """The SD card mount point.
 
-    On this board the card is a plain mounted filesystem under
-    tulip.root_dir() + 'sd' -- the same path sdbrowser.py uses -- so no special
-    API is needed.  Falls back to internal flash so a card-less board still
-    finds /user/wavetables and works."""
+    Uses the same path AMYboard's own SD sketches use -- tulip.root_dir()
+    + 'sd' -- then falls back to a couple of common mounts.  Returns None if no
+    readable mount is found, so the caller can say 'no card' rather than
+    scanning nonsense."""
+    cands = []
     try:
         r = tulip.root_dir()
         if not r.endswith("/"):
             r += "/"
-        sd = r + "sd"
-        os.listdir(sd)
-        return sd
+        cands.append(r + "sd")
     except Exception:
         pass
+    cands += ["/sd", "/flash", "/user"]
+    for p in cands:
+        try:
+            os.listdir(p)
+            return p
+        except Exception:
+            continue
+    return None
+
+
+def _sd_iter(dirpath):
+    """Yield (name, is_dir) for one directory.
+
+    Prefers os.ilistdir (whose entry[1] type field flags a directory as
+    0x4000, exactly as AMYboard's file-browser sketch relies on); falls back to
+    os.listdir + os.stat where ilistdir is absent.  Never raises."""
     try:
-        os.listdir("/sd")
-        return "/sd"
-    except Exception:
+        for entry in os.ilistdir(dirpath):
+            name = entry[0]
+            etype = entry[1] if len(entry) > 1 else None
+            yield name, (etype == 0x4000)
+        return
+    except AttributeError:
         pass
-    return "/user"
+    except OSError:
+        return
+    try:
+        names = os.listdir(dirpath)
+    except OSError:
+        return
+    for name in names:
+        is_dir = False
+        try:
+            is_dir = (os.stat(dirpath + "/" + name)[0] & 0x4000) != 0
+        except Exception:
+            pass
+        yield name, is_dir
 
 
 WT_ROOT = None          # resolved by the first SD scan
@@ -653,29 +690,42 @@ def wt_builtins():
 
 
 def wt_scan_sd():
-    """Discover loadable .wav tables on the SD card WITHOUT loading any.
+    """Recursively find every .wav/.wt on the SD card, WITHOUT loading any.
 
-    Populates the BROWSE list for the WT LOAD page.  Never raises: a missing
-    card, a missing directory or an unreadable entry each just contribute
-    nothing.  Every .wav/.wt is offered (see the PR#997 note above); an
-    unusable one is rejected at load, not hidden here."""
+    Walks the whole card from its mount root, so a file is found wherever the
+    user dropped it -- the old fixed /wavetables/{factory,user} scan was why
+    'nothing shows up'.  Populates the BROWSE list for the WT LOAD page as
+    (display, fullpath), display being the path relative to the card root so
+    two same-named files in different folders stay tellable apart.  Bounded by
+    depth and count, and never raises: a missing card just yields an empty
+    list.  Every .wav/.wt is offered (PR#997); an unusable one is rejected at
+    load, not hidden here."""
     global WT_ROOT, _sd_files
     _sd_files = []
-    WT_ROOT = _sd_root() + "/wavetables"
-    for sub in WT_DIRS:
-        d = WT_ROOT + "/" + sub
-        try:
-            names = sorted(os.listdir(d))
-        except Exception:
-            continue
-        for n in names:
-            ln = n.lower()
-            if not (ln.endswith(".wav") or ln.endswith(".wt")):
+    root = _sd_card_root()
+    WT_ROOT = root
+    if root is None:
+        return 0
+    # Depth-first walk with an explicit stack (no recursion depth worries on
+    # MicroPython).  Directories are pushed to be visited; files are collected.
+    stack = [(root, 0)]
+    while stack and len(_sd_files) < SD_SCAN_MAX_FILES:
+        dirpath, depth = stack.pop()
+        subdirs = []
+        for name, is_dir in _sd_iter(dirpath):
+            if name in _SD_SKIP or name.startswith("."):
                 continue
-            # Tag factory vs user in the display name so two tables with the
-            # same filename in different folders stay tellable apart.
-            disp = ("F:" if sub == "factory" else "") + n.rsplit(".", 1)[0]
-            _sd_files.append((disp[:12], d + "/" + n))
+            full = dirpath + "/" + name
+            if is_dir:
+                if depth < SD_SCAN_MAX_DEPTH:
+                    subdirs.append((full, depth + 1))
+            else:
+                ln = name.lower()
+                if ln.endswith(".wav") or ln.endswith(".wt"):
+                    rel = full[len(root) + 1:]
+                    _sd_files.append((rel, full))
+        stack.extend(reversed(subdirs))
+    _sd_files.sort(key=lambda e: e[0].lower())
     return len(_sd_files)
 
 
@@ -708,11 +758,19 @@ def wt_path(idx):
     return WT_CATALOG[int(clamp(idx, 0, len(WT_CATALOG) - 1))][1]
 
 
+def _sd_basename(rel):
+    """Filename (no folders, no extension) from a browse-list relative path."""
+    return rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+
 def _sd_name(idx):
-    """Display name for a BROWSE-list entry (WT LOAD 'FILE' row)."""
+    """Display name for a BROWSE-list entry (WT LOAD 'FILE' row).
+
+    Shows the bare filename -- the folder path is only there to disambiguate,
+    and the focus row / browser pane show more of it."""
     if not _sd_files:
         return "--SCAN--"
-    return _sd_files[int(clamp(idx, 0, len(_sd_files) - 1))][0]
+    return _sd_basename(_sd_files[int(clamp(idx, 0, len(_sd_files) - 1))][0])
 
 
 def wt_index_of_path(path):
@@ -2019,9 +2077,10 @@ def _wt_load_selected():
     if not _sd_files:
         toast("SCAN SD FIRST")
         return
-    disp, path = _sd_files[int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))]
+    rel, path = _sd_files[int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))]
+    name = _sd_basename(rel)
     existed = wt_index_of_path(path) >= 0
-    idx = wt_add_path(path, disp)
+    idx = wt_add_path(path, name)
     if wt_preset_for(idx) is None:
         if not existed:
             WT_CATALOG.pop()            # remove the fresh, failed append
@@ -2031,7 +2090,7 @@ def _wt_load_selected():
     P["a_wt" if tgt == 0 else "b_wt"] = idx
     wt_remember_selection()
     (apply_osc_a if tgt == 0 else apply_osc_b)()
-    toast("%s -> OSC %s" % (disp[:8], "A" if tgt == 0 else "B"))
+    toast("%s>OSC %s" % (name[:7], "A" if tgt == 0 else "B"))
 
 
 # --------------------------------------------------------------------------
@@ -2102,23 +2161,20 @@ def _apply_patch(rec):
             if dest in DEST_IDS and 0 <= slot < NMOD and mod_can_reach(slot, dest):
                 MATRIX[(slot, dest)] = amt
 
-    # Wavetables come back by PATH.  Because boot no longer scans the card, a
-    # patch's SD table usually is NOT in the catalogue yet -- so scan once when
-    # a referenced path is unknown, then resolve it: an existing file rejoins
+    # Wavetables come back by PATH (an absolute path on the card).  Because
+    # boot no longer scans, a patch's SD table usually is NOT in the catalogue
+    # yet -- so resolve it directly: if the file is still on the card it rejoins
     # the catalogue, a genuinely missing one falls back to the first built-in
     # and says so, rather than loading a different table in silence.
     _a_wt_path = rec.get("a_wt_path")
     _b_wt_path = rec.get("b_wt_path")
-    if any(p is not None and wt_index_of_path(p) < 0
-           for p in (_a_wt_path, _b_wt_path)):
-        wt_scan_sd()
     missing = False
     for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
         if path is None:
             continue
         i = wt_index_of_path(path)
         if i < 0 and _file_exists(path):
-            i = wt_add_path(path)
+            i = wt_add_path(path, _sd_basename(path))
         if i >= 0:
             P[key] = i
         else:
@@ -2774,10 +2830,11 @@ def draw_vis_wtload(d, y0, h):
     y_hi = y0 + h
     d.fill_rect(0, y0, SCREEN_W, h, 0)
     tgt = "A" if int(P["wt_src"]) == 0 else "B"
-    d.text("-> OSC " + tgt, 2, y0, C_DIM)
+    d.text("-> OSC %s   %d FILES" % (tgt, len(_sd_files)), 2, y0, C_DIM)
     if not _sd_files:
         d.text("RUN SCAN SD", 2, y0 + 14, C_LABEL)
         d.text("TO LIST .wav", 2, y0 + 26, C_DIM)
+        d.text("ON THE CARD", 2, y0 + 38, C_DIM)
         return
     sel = int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))
     top = max(0, min(sel - 2, max(0, len(_sd_files) - 5)))
@@ -2788,7 +2845,7 @@ def draw_vis_wtload(d, y0, h):
         y = y0 + 12 + k * 10
         if y + 8 > y_hi:
             break
-        name = _sd_files[i][0]
+        name = _sd_basename(_sd_files[i][0])
         if i == sel:
             _vrect(d, 0, y - 1, SCREEN_W, 9, C_VIS, y0, y_hi)
             d.text(name[:15], 2, y, 0)
@@ -3431,8 +3488,30 @@ def wt_list():
 def wt_scan():
     """Scan the SD card from the REPL (same as SCAN SD on the WT LOAD page)."""
     n = wt_scan_sd()
-    print("%d wavetable file(s) on SD under %s" % (n, WT_ROOT))
+    print("%d wavetable file(s) found on SD (root: %s)" % (n, WT_ROOT))
+    for rel, path in _sd_files:
+        print("  ", path)
+    if n == 0:
+        print("  none.  Try sd_ls() to see the raw card contents.")
     return n
+
+
+def sd_ls(dirpath=None, depth=0):
+    """Raw recursive listing of the SD card, for diagnosing an empty scan.
+
+    Shows every file and folder (not just .wav) so you can confirm the card is
+    mounted and see where your files actually live."""
+    if dirpath is None:
+        dirpath = _sd_card_root()
+        if dirpath is None:
+            print("No SD card mount found (tried tulip.root_dir()+'sd', /sd, "
+                  "/flash, /user).")
+            return
+        print("SD root:", dirpath)
+    for name, is_dir in _sd_iter(dirpath):
+        print("  " * (depth + 1) + name + ("/" if is_dir else ""))
+        if is_dir and depth < 3 and name not in _SD_SKIP and not name.startswith("."):
+            sd_ls(dirpath + "/" + name, depth + 1)
 
 
 def matrix_list():
@@ -3569,7 +3648,7 @@ def boot():
 
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
-    print("REPL helpers: status()  wt_list()  wt_selftest()  matrix_list()")
+    print("REPL helpers: status()  wt_list()  wt_scan()  sd_ls()  wt_selftest()")
     need_redraw = True
 
 

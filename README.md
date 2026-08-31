@@ -27,33 +27,40 @@ per voice (5 AMY oscillators)          4 voices = 20 oscs, 8 sounding
 1. Copy `sketch_wt.py` to the board and run it. It **boots on the five built-in
    wavetables** (`INT 0`…`INT 4`) and listens on MIDI channel 1. Startup never
    touches the SD card, so a missing or slow card can't stall or break it.
-2. To use your own tables, copy the `wavetables/` tree to the SD card root
-   (`/wavetables/factory/...`, `/wavetables/user/...`), then load one from the
-   **WT LOAD** page — see below. Nothing on the card is read until you ask.
-3. From the REPL: `status()`, `wt_list()`, `wt_scan()`, `matrix_list()`,
+2. To use your own tables, copy `.wav` files **anywhere on the SD card** —
+   any folder, any depth — then load one from the **WT LOAD** page (below).
+   No fixed folder layout is required. Nothing on the card is read until you ask.
+3. From the REPL: `status()`, `wt_list()`, `wt_scan()`, `sd_ls()`,
    `wt_selftest()`.
 
 ### Loading a wavetable from SD
 
 The synth always starts on its built-ins; SD tables are an explicit opt-in on
-the **WT LOAD** page:
+the **WT LOAD** page. Select the target oscillator, browse the card, load:
 
 | row | what it does |
 |-----|--------------|
-| **SCAN SD** | reads the card and lists every `.wav`/`.wt` under `/wavetables/` — this is the only time the card is touched, and it loads nothing |
-| **FILE** | browse the discovered files |
 | **TARGET** | which oscillator to load into — OSC A or OSC B |
+| **SCAN SD** | recursively scans the **whole card** and lists every `.wav`/`.wt` it finds, wherever they live — the only time the card is touched, and it loads nothing |
+| **FILE** | browse the found files |
 | **LOAD** | streams the chosen file into RAM, adds it to the `TABLE` knob's catalogue and selects it on the target oscillator |
 
-A loaded table then behaves like any built-in — it stays on the `TABLE` knob,
-and a patch that references it stores it **by filename**. Loading verifies the
-file first, so a too-short or corrupt one reports `LOAD FAILED` instead of going
-silent. PR [shorepine/amy#997](https://github.com/shorepine/amy/pull/997) means
-**any `.wav` of at least 512 samples works**, not only purpose-built tables —
-ordinary one-shot samples are fair game.
+The files are **16-bit PCM WAV** (that's what "PCM file" means here — the same
+format as any sample). A loaded table then behaves like any built-in — it stays
+on the `TABLE` knob, and a patch that references it stores it **by full path**.
+Loading verifies the file first, so a too-short or corrupt one reports
+`LOAD FAILED` instead of going silent. PR
+[shorepine/amy#997](https://github.com/shorepine/amy/pull/997) means **any
+`.wav` of at least 512 samples works**, not only purpose-built tables — ordinary
+one-shot samples are fair game.
 
-When you load a patch that names an SD table, the synth scans the card once to
-resolve it; if the file is gone it falls back to a built-in and says so.
+If **SCAN SD finds nothing**, run `sd_ls()` at the REPL: it prints the raw card
+contents (all files and folders) so you can confirm the card is mounted and see
+where your files actually are. `wt_scan()` prints the full path of every `.wav`
+the scan matched.
+
+When you load a patch that names an SD table, the synth resolves it directly by
+path; if the file is gone it falls back to a built-in and says so.
 
 ### Check your firmware first
 
