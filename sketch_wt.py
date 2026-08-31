@@ -83,17 +83,25 @@ def clamp(v, lo, hi):
 #  _KW_MAP_LIST (the source of truth for send() kwargs) and docs/api.md.
 #
 #  AVAILABLE, USED AS ASKED
-#    * wave=WAVETABLE (amy.h: 19).  One preset = one 64-cycle table, 256
-#      samples per cycle, 16384 samples total.  `duty` crossfades across the
-#      cycles -- so WAVETABLE POSITION IS THE `duty` CONTROL-COEFFICIENT LIST,
-#      which means position scanning is modulated inside AMY's DSP by
-#      envelopes and LFOs at zero MicroPython cost.  (oscillators.c
-#      render_wavetable.)
+#    * wave=WAVETABLE (amy.h: 19).  A table is 256 samples per cycle; the cycle
+#      count is sample_length >> 8, so 16384 samples is 64 cycles.  `duty`
+#      crossfades across the cycles -- so WAVETABLE POSITION IS THE `duty`
+#      CONTROL-COEFFICIENT LIST, which means position scanning is modulated
+#      inside AMY's DSP by envelopes and LFOs at zero MicroPython cost.
+#      (oscillators.c render_wavetable.)
 #    * Custom wavetables from SD.  render_wavetable calls
 #      pcm_get_sample_ram_for_preset(), and pcm.c's get_preset_for_preset_number
 #      checks RAM/memory presets FIRST -- they shadow the baked-in ROM presets.
 #      So amy.load_sample(path, preset=N) makes an SD .wav playable as
 #      wave=WAVETABLE, preset=N.  This is the whole SD wavetable mechanism.
+#      shorepine/amy#997 widened it: ANY PCM .wav of at least two 256-sample
+#      cycles (>= 512 samples) is a valid wavetable now, not only purpose-built
+#      64-cycle ones -- render_wavetable only requires sample_length >=
+#      2*256 and derives the cycle count from the length -- so ordinary
+#      one-shot samples can be scanned as wavetables too.  The synth ALWAYS
+#      boots on its built-in tables and reads the card only on demand (the WT
+#      LOAD page, or a patch that names an SD table); see wt_builtins() /
+#      wt_scan_sd() and the STARTUP CONTRACT note in section 3.
 #    * Per-osc filter: filter_type 0-6 = none / LP12 / BP / HP / LP24 / NOTCH /
 #      PHASER, `resonance` 0.5-16, cutoff as a coefficient list (const Hz,
 #      other terms in OCTAVES) so cutoff modulation is free.
@@ -356,6 +364,10 @@ P = {
     # ---- mix / global ----------------------------------------------------
     "vmode": VM_UNISON, "glide": 0.0, "vsens": 0.4, "phsync": 1,
     "bend": 2.0, "mch": 1, "vol": 4.0, "panic": 0,
+    # ---- WT LOAD page: browse + load a user wavetable from SD -------------
+    # None of these is a sound parameter -- they drive the SD browser, so a
+    # patch never stores them (see PATCH_SKIP).
+    "wt_src": 0, "wt_browse": 0, "wt_load": 0, "wt_scan_act": 0,
     # ---- filter ----------------------------------------------------------
     "ftype": 4, "cutoff": 2500.0, "reso": 1.2, "fenv": 1.5,
     "fkbd": 0.35, "fvel": 0.25, "fdrv": 1.0, "fmix": 1.0,
@@ -494,6 +506,15 @@ WT_BUILTIN_COUNT = 5
 
 WT_DIRS = ("factory", "user")   # under WT_ROOT, per the brief's layout
 
+# STARTUP CONTRACT: the synth ALWAYS boots on the built-in tables (INT 0..4)
+# and never reads the SD card on its own -- a missing, slow or unformatted card
+# can never stall or break startup.  SD tables are pulled in only deliberately,
+# from the WT LOAD page, or automatically when a saved patch names one.  PR
+# shorepine/amy#997 widened what counts as a wavetable: ANY PCM .wav of at
+# least two 256-sample cycles (>= 512 samples) works now, not just
+# purpose-built 64-cycle tables, so the browser offers every .wav on the card
+# and an unusable one is caught at load time rather than being pre-filtered.
+
 
 def _sd_root():
     """Where the SD card is mounted.
@@ -519,12 +540,20 @@ def _sd_root():
     return "/user"
 
 
-WT_ROOT = None          # resolved once at boot by wt_scan()
+WT_ROOT = None          # resolved by the first SD scan
 
-# The catalogue: a list of (display_name, path_or_None, builtin_preset_or_None).
-# Index 0.. are what the OSC A/B TABLE knobs select between.  Built-ins come
-# first so the knob always has something valid at index 0.
+# The catalogue the OSC A/B TABLE knobs scroll through: a list of
+# (display_name, path_or_None, builtin_preset_or_None).  It holds the built-in
+# tables ALWAYS, plus any SD tables that have been explicitly loaded (WT LOAD
+# page) or pulled in by a patch.  Built-ins come first, so index 0 is always
+# valid.  It is NOT populated from the card at boot.
 WT_CATALOG = []
+
+# Files discovered on the SD card by an explicit scan, as (display, path).
+# This is the BROWSE list for the WT LOAD page, kept separate from the
+# catalogue: scanning shows you what is on the card; loading is what commits a
+# file to a preset slot and RAM and adds it to the catalogue.
+_sd_files = []
 
 # path -> preset slot, plus an LRU of slot usage.
 _wt_slot_of = {}
@@ -532,15 +561,34 @@ _wt_slot_lru = []
 _wt_failed = set()      # paths that would not load; never retried automatically
 
 
-def wt_scan():
-    """Build the wavetable catalogue from the SD card.
+def _file_exists(path):
+    try:
+        os.stat(path)
+        return True
+    except Exception:
+        return False
 
-    Never raises: a missing card, a missing directory or an unreadable entry
-    each just contribute nothing, and the built-ins are always present."""
-    global WT_ROOT, WT_CATALOG
-    WT_CATALOG = []
-    for i in range(WT_BUILTIN_COUNT):
-        WT_CATALOG.append(("INT %d" % i, None, WT_BUILTIN_BASE + i))
+
+def wt_builtins():
+    """Reset the catalogue to the built-in tables alone.
+
+    Called at boot.  The synth always comes up playable on its firmware
+    wavetables with no SD access at all, honouring the STARTUP CONTRACT above."""
+    global WT_CATALOG
+    WT_CATALOG = [("INT %d" % i, None, WT_BUILTIN_BASE + i)
+                  for i in range(WT_BUILTIN_COUNT)]
+    return len(WT_CATALOG)
+
+
+def wt_scan_sd():
+    """Discover loadable .wav tables on the SD card WITHOUT loading any.
+
+    Populates the BROWSE list for the WT LOAD page.  Never raises: a missing
+    card, a missing directory or an unreadable entry each just contribute
+    nothing.  Every .wav/.wt is offered (see the PR#997 note above); an
+    unusable one is rejected at load, not hidden here."""
+    global WT_ROOT, _sd_files
+    _sd_files = []
     WT_ROOT = _sd_root() + "/wavetables"
     for sub in WT_DIRS:
         d = WT_ROOT + "/" + sub
@@ -555,8 +603,21 @@ def wt_scan():
             # Tag factory vs user in the display name so two tables with the
             # same filename in different folders stay tellable apart.
             disp = ("F:" if sub == "factory" else "") + n.rsplit(".", 1)[0]
-            WT_CATALOG.append((disp[:12], d + "/" + n, None))
-    return len(WT_CATALOG)
+            _sd_files.append((disp[:12], d + "/" + n))
+    return len(_sd_files)
+
+
+def wt_add_path(path, disp=None):
+    """Add an SD table to the catalogue if not already present; return its
+    catalogue index.  How a browsed file -- or a patch's stored filename --
+    becomes selectable on the TABLE knob."""
+    i = wt_index_of_path(path)
+    if i >= 0:
+        return i
+    if disp is None:
+        disp = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    WT_CATALOG.append((disp[:12], path, None))
+    return len(WT_CATALOG) - 1
 
 
 def wt_count():
@@ -573,6 +634,13 @@ def wt_path(idx):
     if not WT_CATALOG:
         return None
     return WT_CATALOG[int(clamp(idx, 0, len(WT_CATALOG) - 1))][1]
+
+
+def _sd_name(idx):
+    """Display name for a BROWSE-list entry (WT LOAD 'FILE' row)."""
+    if not _sd_files:
+        return "--SCAN--"
+    return _sd_files[int(clamp(idx, 0, len(_sd_files) - 1))][0]
 
 
 def wt_index_of_path(path):
@@ -670,34 +738,24 @@ def wt_preset_or_fallback(idx):
     return p
 
 
-def wt_rescan():
-    """Re-read the card (an SD swap, or tables copied over while running).
-
-    Clears the failure list so a table that was missing gets another chance,
-    but keeps the loaded-slot cache: a path that is still present is still
-    valid in RAM, so a rescan does not force a reload of what is playing."""
-    _wt_failed.clear()
-    n = wt_scan()
-    # A patch names its tables by path; re-resolve both in case indices moved.
-    _repair_wt_indices()
-    return n
-
-
 _a_wt_path = None       # path the patch asked for, or None for a built-in
 _b_wt_path = None
 
 
-def _repair_wt_indices():
-    """Point a_wt / b_wt back at the paths the patch actually named."""
+def wt_rescan():
+    """Re-read the card (an SD swap, or tables copied over while running).
+
+    Refreshes the BROWSE list and clears the failure blacklist so a table that
+    went missing gets another chance.  Also re-resolves the two patch table
+    paths: if a card swap brought a referenced table back, it rejoins the
+    catalogue and the oscillator points at it again.  Does not disturb what is
+    already loaded in RAM."""
+    _wt_failed.clear()
+    n = wt_scan_sd()
     for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
-        if path is None:
-            continue
-        i = wt_index_of_path(path)
-        if i >= 0:
-            P[key] = i
-        else:
-            print("wt: patch table missing:", path)
-            P[key] = 0
+        if path is not None and wt_index_of_path(path) < 0 and _file_exists(path):
+            P[key] = wt_add_path(path)
+    return n
 
 
 def wt_remember_selection():
@@ -1492,9 +1550,10 @@ def panic():
 #  kinds: 'f' float  'i' int  'e' enum  'ms' time  'hz' frequency
 #         'ct' cents  'a' momentary action  'wt' wavetable name
 MOD_SLOT_NAMES = ["MOD1", "MOD2", "MOD3", "MOD4"]
+WT_TARGETS = ["OSC A", "OSC B"]
 
 ENUM_LISTS = {
-    "vmode": VOICE_MODES, "ftype": FILTERS,
+    "vmode": VOICE_MODES, "ftype": FILTERS, "wt_src": WT_TARGETS,
     "a_fold": ONOFF, "b_fold": ONOFF, "phsync": ONOFF,
     "d_clip": ONOFF, "d_fold": ONOFF,
     "m1_shape": LFO_SHAPES, "m2_shape": LFO_SHAPES,
@@ -1527,6 +1586,20 @@ PAGES = [
         ("DRIVE",  "b_drv",    1.0, 16.0, 0.25, 'f', 'b'),
         ("FOLD",   "b_fold",   0, 1,      1,    'e', 'b'),
         ("PHASE",  "b_phase",  0.0, 1.0,  0.05, 'f', 'rebuild'),
+    ]),
+    # Load a user wavetable from the SD card.  The synth boots on its built-in
+    # tables (INT 0..4) and never touches the card on its own -- this page is
+    # the deliberate opt-in.  SCAN SD lists what is on the card, FILE browses
+    # it, TARGET picks which oscillator, and LOAD commits the chosen file:
+    # streaming it into RAM, adding it to the TABLE knob's catalogue and
+    # selecting it on that oscillator.  Any .wav of >= 512 samples works
+    # (shorepine/amy#997), so ordinary samples are fair game, not only
+    # purpose-built tables.
+    ("WT LOAD", [
+        ("TARGET",  "wt_src",      0, 1,   1, 'e',  'none'),
+        ("FILE",    "wt_browse",   0, 999, 1, 'sd', 'none'),
+        ("LOAD",    "wt_load",     0, 1,   1, 'a',  'none'),
+        ("SCAN SD", "wt_scan_act", 0, 1,   1, 'a',  'none'),
     ]),
     ("MIX", [
         ("VOICE",  "vmode",   0, 2,      1,    'e', 'mode'),
@@ -1660,6 +1733,7 @@ SHORT = {
     "b_lvl": "LVL", "b_drv": "DRIV", "b_fold": "FOLD", "b_phase": "PHAS",
     "vmode": "VOIC", "glide": "GLID", "vsens": "VSNS", "phsync": "SYNC",
     "bend": "BEND", "mch": "MIDI", "vol": "VOL", "panic": "PNIC",
+    "wt_src": "DEST", "wt_browse": "FILE", "wt_load": "LOAD", "wt_scan_act": "SCAN",
     "ftype": "TYPE", "cutoff": "CUT", "reso": "RESO", "fenv": "ENV",
     "fkbd": "KBD", "fvel": "VEL", "fdrv": "DRIV", "fmix": "MIX",
     "aa": "A.A", "ad": "A.D", "as": "A.S", "ar": "A.R", "acurve": "CRV",
@@ -1720,6 +1794,8 @@ def fmt_value(key, kind, v):
         return "GO"
     if kind == 'wt':
         return wt_name(v)
+    if kind == 'sd':
+        return _sd_name(v)
     if kind == 'e':
         lst = ENUM_LISTS.get(key)
         if lst:
@@ -1746,6 +1822,8 @@ def cell_value(key, kind, v):
         return "GO"
     if kind == 'wt':
         return wt_name(v)[:4]
+    if kind == 'sd':
+        return _sd_name(v)[:4]
     if kind == 'e':
         lst = ENUM_LISTS.get(key)
         if lst:
@@ -1777,16 +1855,18 @@ def row_hi(row):
     label, key, lo, hi, step, kind, group = row
     if kind == 'wt':
         return max(0, wt_count() - 1)
+    if kind == 'sd':
+        return max(0, len(_sd_files) - 1)
     return hi
 
 
 def bump(row, delta):
     """Move a parameter by `delta` encoder detents, and return its apply group."""
     label, key, lo, hi, step, kind, group = eff_row(row)
-    if kind == 'wt':
+    if kind in ('wt', 'sd'):
         hi = row_hi(row)
     v = P[key]
-    if kind in ('e', 'i', 'a', 'wt'):
+    if kind in ('e', 'i', 'a', 'wt', 'sd'):
         v = int(v) + delta
     elif kind == 'hz':
         # Exponential, so a knob feels right across 30 Hz .. 12 kHz.
@@ -1843,7 +1923,38 @@ def fire_action(key):
         P["mx_amt"] = 0.0
         apply_matrix()
         toast("MATRIX CLEARED")
+    elif key == "wt_scan_act":
+        n = wt_scan_sd()
+        P["wt_browse"] = 0
+        toast("%d ON SD" % n if n else "NO SD FILES")
+    elif key == "wt_load":
+        _wt_load_selected()
     P[key] = 0
+
+
+def _wt_load_selected():
+    """Commit the browsed SD file to the chosen oscillator.
+
+    Verifies the table actually loads BEFORE committing the selection, so a
+    short or corrupt file reports here rather than going silent on the next
+    note.  A file that fails is dropped straight back out of the catalogue, so
+    the TABLE knob is never left pointing at a dud."""
+    if not _sd_files:
+        toast("SCAN SD FIRST")
+        return
+    disp, path = _sd_files[int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))]
+    existed = wt_index_of_path(path) >= 0
+    idx = wt_add_path(path, disp)
+    if wt_preset_for(idx) is None:
+        if not existed:
+            WT_CATALOG.pop()            # remove the fresh, failed append
+        toast("LOAD FAILED")
+        return
+    tgt = int(P["wt_src"])
+    P["a_wt" if tgt == 0 else "b_wt"] = idx
+    wt_remember_selection()
+    (apply_osc_a if tgt == 0 else apply_osc_b)()
+    toast("%s -> OSC %s" % (disp[:8], "A" if tgt == 0 else "B"))
 
 
 # --------------------------------------------------------------------------
@@ -1860,7 +1971,8 @@ MAX_PATCHES = 24
 
 # Momentary actions and the matrix cursor are UI state, not sound: saving them
 # would fire a PANIC (or move somebody's cursor) on every load of that patch.
-PATCH_SKIP = ("panic", "mx_clr", "mx_clrall", "mx_slot", "mx_dest", "mx_amt")
+PATCH_SKIP = ("panic", "mx_clr", "mx_clrall", "mx_slot", "mx_dest", "mx_amt",
+              "wt_src", "wt_browse", "wt_load", "wt_scan_act")
 
 DEFAULTS = dict(P)
 DEFAULT_MATRIX = dict(MATRIX)
@@ -1913,15 +2025,23 @@ def _apply_patch(rec):
             if dest in DEST_IDS and 0 <= slot < NMOD and mod_can_reach(slot, dest):
                 MATRIX[(slot, dest)] = amt
 
-    # Wavetables come back by PATH.  Anything missing falls back to the first
-    # built-in and says so, rather than loading a different table in silence.
+    # Wavetables come back by PATH.  Because boot no longer scans the card, a
+    # patch's SD table usually is NOT in the catalogue yet -- so scan once when
+    # a referenced path is unknown, then resolve it: an existing file rejoins
+    # the catalogue, a genuinely missing one falls back to the first built-in
+    # and says so, rather than loading a different table in silence.
     _a_wt_path = rec.get("a_wt_path")
     _b_wt_path = rec.get("b_wt_path")
+    if any(p is not None and wt_index_of_path(p) < 0
+           for p in (_a_wt_path, _b_wt_path)):
+        wt_scan_sd()
     missing = False
     for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
         if path is None:
             continue
         i = wt_index_of_path(path)
+        if i < 0 and _file_exists(path):
+            i = wt_add_path(path)
         if i >= 0:
             P[key] = i
         else:
@@ -2187,7 +2307,7 @@ def cur_rows():
 def cell_norm(row):
     """(fill 0..1, bipolar) for a row's bar."""
     label, key, lo, hi, step, kind, group = eff_row(row)
-    if kind == 'wt':
+    if kind in ('wt', 'sd'):
         hi = row_hi(row)
     v = float(P[key])
     if hi <= lo:
@@ -2569,6 +2689,36 @@ def draw_vis_unison(d, y0, h):
     _vrect(d, SCREEN_W // 2, y0, 1, h, C_PAGE_OFF, y0, y_hi)
 
 
+def draw_vis_wtload(d, y0, h):
+    """The SD browser: the file list with the cursor, and the load target.
+
+    Empty until SCAN SD is run, which is the whole point -- the card is only
+    read on demand."""
+    y_hi = y0 + h
+    d.fill_rect(0, y0, SCREEN_W, h, 0)
+    tgt = "A" if int(P["wt_src"]) == 0 else "B"
+    d.text("-> OSC " + tgt, 2, y0, C_DIM)
+    if not _sd_files:
+        d.text("RUN SCAN SD", 2, y0 + 14, C_LABEL)
+        d.text("TO LIST .wav", 2, y0 + 26, C_DIM)
+        return
+    sel = int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))
+    top = max(0, min(sel - 2, max(0, len(_sd_files) - 5)))
+    for k in range(5):
+        i = top + k
+        if i >= len(_sd_files):
+            break
+        y = y0 + 12 + k * 10
+        if y + 8 > y_hi:
+            break
+        name = _sd_files[i][0]
+        if i == sel:
+            _vrect(d, 0, y - 1, SCREEN_W, 9, C_VIS, y0, y_hi)
+            d.text(name[:15], 2, y, 0)
+        else:
+            d.text(name[:15], 2, y, C_LABEL)
+
+
 def draw_vis_voices(d, y0, h):
     """Which voices are sounding, and the mode that put them there."""
     y_hi = y0 + h
@@ -2637,6 +2787,8 @@ def draw_visual(d):
         draw_vis_wavetable(d, y0, h, "a")
     elif name == "OSC B":
         draw_vis_wavetable(d, y0, h, "b")
+    elif name == "WT LOAD":
+        draw_vis_wtload(d, y0, h)
     elif name == "MIX":
         # The output oscilloscope lives here: MIX is this synth's main page.
         draw_scope(d)
@@ -2839,7 +2991,7 @@ def patch_click():
     elif sel == "<RESCAN WT>":
         n = wt_rescan()
         apply_ab()
-        toast("%d TABLES" % n)
+        toast("%d ON SD" % n if n else "NO SD FILES")
     else:
         pmode = 'menu'
         pmenu_i = 0
@@ -3180,7 +3332,7 @@ def wt_selftest(note=60, ms=400):
 
 def wt_list():
     """Print the wavetable catalogue and which tables are resident in RAM."""
-    print("wavetable root:", WT_ROOT)
+    print("catalogue (TABLE knob) -- root:", WT_ROOT or "(SD not scanned yet)")
     for i in range(len(WT_CATALOG)):
         name, path, builtin = WT_CATALOG[i]
         where = "builtin preset %d" % builtin if builtin is not None else path
@@ -3191,6 +3343,19 @@ def wt_list():
             live = "  [FAILED]"
         print("  %2d  %-12s %s%s" % (i, name, where, live))
     print("%d/%d RAM slots in use" % (len(_wt_slot_of), WT_SLOTS))
+    if _sd_files:
+        print("SD browse list (WT LOAD page):")
+        for i, (name, path) in enumerate(_sd_files):
+            print("  %2d  %-12s %s" % (i, name, path))
+    else:
+        print("SD not scanned -- run wt_scan_sd() or SCAN SD on the WT LOAD page")
+
+
+def wt_scan():
+    """Scan the SD card from the REPL (same as SCAN SD on the WT LOAD page)."""
+    n = wt_scan_sd()
+    print("%d wavetable file(s) on SD under %s" % (n, WT_ROOT))
+    return n
 
 
 def matrix_list():
@@ -3262,8 +3427,12 @@ def boot():
     amy.reset()                     # the one and only reset
     boot_amy()
 
-    n = wt_scan()
-    print("wavetables: %d entries under %s" % (n, WT_ROOT))
+    # STARTUP CONTRACT: built-in tables only, no SD access.  The card is read
+    # only later, on demand, from the WT LOAD page or when a patch names a
+    # table -- so a missing or slow card can never stall or break boot.
+    n = wt_builtins()
+    print("wavetables: %d built-in (INT 0..%d); load SD tables on the WT LOAD page"
+          % (n, WT_BUILTIN_COUNT - 1))
     wt_remember_selection()
 
     try:

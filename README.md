@@ -24,14 +24,36 @@ per voice (5 AMY oscillators)          4 voices = 20 oscs, 8 sounding
 
 ## Getting started
 
-1. Copy `sketch_wt.py` to the board and run it. It boots, scans for wavetables
-   and starts listening on MIDI channel 1.
-2. Copy the `wavetables/` tree to the SD card root, so the board sees
-   `/wavetables/factory/...` and `/wavetables/user/...`.
-3. From the REPL: `status()`, `wt_list()`, `matrix_list()`, `wt_selftest()`.
+1. Copy `sketch_wt.py` to the board and run it. It **boots on the five built-in
+   wavetables** (`INT 0`…`INT 4`) and listens on MIDI channel 1. Startup never
+   touches the SD card, so a missing or slow card can't stall or break it.
+2. To use your own tables, copy the `wavetables/` tree to the SD card root
+   (`/wavetables/factory/...`, `/wavetables/user/...`), then load one from the
+   **WT LOAD** page — see below. Nothing on the card is read until you ask.
+3. From the REPL: `status()`, `wt_list()`, `wt_scan()`, `matrix_list()`,
+   `wt_selftest()`.
 
-Without an SD card it still works — five wavetables are baked into the
-firmware and appear as `INT 0`…`INT 4`.
+### Loading a wavetable from SD
+
+The synth always starts on its built-ins; SD tables are an explicit opt-in on
+the **WT LOAD** page:
+
+| row | what it does |
+|-----|--------------|
+| **SCAN SD** | reads the card and lists every `.wav`/`.wt` under `/wavetables/` — this is the only time the card is touched, and it loads nothing |
+| **FILE** | browse the discovered files |
+| **TARGET** | which oscillator to load into — OSC A or OSC B |
+| **LOAD** | streams the chosen file into RAM, adds it to the `TABLE` knob's catalogue and selects it on the target oscillator |
+
+A loaded table then behaves like any built-in — it stays on the `TABLE` knob,
+and a patch that references it stores it **by filename**. Loading verifies the
+file first, so a too-short or corrupt one reports `LOAD FAILED` instead of going
+silent. PR [shorepine/amy#997](https://github.com/shorepine/amy/pull/997) means
+**any `.wav` of at least 512 samples works**, not only purpose-built tables —
+ordinary one-shot samples are fair game.
+
+When you load a patch that names an SD table, the synth scans the card once to
+resolve it; if the file is gone it falls back to a built-in and says so.
 
 ### Check your firmware first
 
@@ -94,8 +116,8 @@ by envelopes and LFOs at zero MicroPython cost.
 
 ## Pages
 
-`OSC A · OSC B · MIX · FILTER · ENV · MOD 1 · MOD 2 · MOD 3 · MOD 4 · MATRIX ·
-UNISON · DRIVE · FX · REVERB · PATCH`
+`OSC A · OSC B · WT LOAD · MIX · FILTER · ENV · MOD 1 · MOD 2 · MOD 3 · MOD 4 ·
+MATRIX · UNISON · DRIVE · FX · REVERB · PATCH`
 
 Turn to move, click to edit, **hold to pick a screen**. On an 8-encoder board
 each encoder edits its own row directly. Every page carries a picture of what
@@ -113,20 +135,22 @@ whatever now sits at the old index.
 
 ## Custom wavetables
 
-AMY expects **16-bit mono PCM, 256 samples per cycle, 64 cycles = 16384
-samples**. `tools/make_wavetable.py` builds them (a desktop-side utility — the
-synth itself remains one file):
+AMY wants **16-bit mono PCM, 256 samples per cycle**. A purpose-built table is
+**64 cycles = 16384 samples**, but since PR #997 any `.wav` of at least
+**512 samples** (two cycles) works — AMY derives the cycle count from the file
+length. `tools/make_wavetable.py` builds proper tables (a desktop-side utility —
+the synth itself stays one file):
 
 ```bash
 python3 tools/make_wavetable.py --all --out wavetables/factory
 python3 tools/make_wavetable.py --from-wav yourfile.wav --out wavetables/user
 ```
 
-Tables are loaded into AMY RAM presets on demand through a 4-slot LRU cache, so
-a patch loads the two tables it names and nothing else. Loading is slow (a
-16384-sample table is ~175 wire messages), so it only ever happens on an
-explicit table selection or patch load, with the voices silenced first — never
-from `loop()`.
+Copy the results to the SD card and load them from the **WT LOAD** page (above).
+Tables go into AMY RAM presets on demand through a 4-slot LRU cache, so a patch
+loads only the two tables it names. Loading is slow (a 16384-sample table is
+~175 wire messages), so it happens only on an explicit `LOAD` or a patch load,
+with the voices silenced first — never from `loop()`.
 
 ## What AMY cannot do, and what is here instead
 
