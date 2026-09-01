@@ -153,13 +153,36 @@ by envelopes and LFOs at zero MicroPython cost.
 ## Pages
 
 `OSC A · OSC B · WT LOAD · MIX · FILTER · ENV · MOD 1 · MOD 2 · MOD 3 · MOD 4 ·
-MATRIX · UNISON · DRIVE · FX · REVERB · PATCH`
+MATRIX · UNISON · DRIVE · FX · REVERB · CV CAL · PATCH`
 
 Turn to move, click to edit, **hold to pick a screen**. On an 8-encoder board
 each encoder edits its own row directly. Every page carries a picture of what
 its settings are doing — the output oscilloscope on MIX, the filter response
 curve, ADSR shapes, LFO waveforms, the live matrix grid, the unison spread and
 the distortion transfer curve.
+
+## Eurorack CV in
+
+CV support is ported from the Megatron build (verified on hardware). **CV1 =
+gate/trigger, CV2 = 1V/oct pitch**, both handled in AMY's audio thread — the
+gate is AMY's own C-side edge detector, and in *track* mode the pitch CV is a
+live term on the oscillators' `ext` freq coefficient, so it bends notes
+continuously (real-VCO behaviour). CV drives **voice 0**; MIDI keeps the rest.
+
+The **CV CAL** page calibrates by ear, live (no capture/apply dance):
+
+| row | what it does |
+|-----|--------------|
+| **ATTEN** | coarse pitch correction, ±2 V |
+| **OFFSET** | fine pitch correction, ±2 V — dial 0 V to the `0V NOTE` |
+| **GATE V** | gate-on threshold (clears an unpatched jack's float; release follows at half) |
+| **0V NOTE** | the MIDI note 0 V should sound |
+
+The pane shows both jacks live, the gate trigger state, and the note CV2
+currently resolves to. Calibration is saved to `/user/wt_cv_cal.json` on leaving
+the page and restored at boot; it is **not** part of a patch (it describes your
+rig, not a sound). REPL: `cv_status()` for a live read, `cv_cal(note)` to fit
+the scale/offset from two measured points.
 
 ## Patches
 

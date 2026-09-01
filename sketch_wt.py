@@ -290,6 +290,7 @@ WT_FALLBACK_WAVE = W_SAW_DOWN
 # Control-coefficient slot indices, from parse_ctrl_coefs()'s docstring:
 #   0 const, 1 note, 2 vel, 3 eg0, 4 eg1, 5 mod0, 6 bend, 7 ext0, 8 ext1, 9 mod1
 C_CONST, C_NOTE, C_VEL, C_EG0, C_EG1, C_MOD0, C_BEND = 0, 1, 2, 3, 4, 5, 6
+C_EXT0, C_EXT1 = 7, 8       # external CV inputs 0/1 (AMY cv_in channels 0/1)
 C_MOD1 = 9
 NCOEF = 10
 
@@ -298,6 +299,85 @@ NCOEF = 10
 # sum -- a resonant biquad driven past Nyquist goes unstable and rings at a
 # fixed pitch on every note.  Inherited straight from the Megatron build.
 FILT_CEILING = 15000.0
+
+
+# --------------------------------------------------------------------------
+#  EURORACK CV IN  --  CV1 = GATE, CV2 = 1V/oct PITCH
+# --------------------------------------------------------------------------
+#  Ported verbatim from the Megatron (megatron_v1) build, which is verified
+#  working on this hardware.  The ONLY adaptations are structural: the note is
+#  addressed to voice 0's SILENT head (this synth is four one-voice synths, not
+#  one 8-osc voice), and the pitch CV rides the wavetable oscillators' `ext`
+#  freq coefficient via osc_freq_coefs().  Everything else -- the gate edge
+#  detector, the track/gate pitch paths, the by-ear calibration -- is the
+#  Megatron's code.
+#
+#  Both paths run in AMY's AUDIO THREAD, never a Python loop() poll: the gate
+#  is AMY's own C-side edge detector (cv_trigger), and TRACK-mode pitch is a
+#  live term on the oscillator freq coefficient evaluated once per audio block.
+CV_PITCH_MODE  = 'track'   # 'track' (continuous) or 'gate' (sample-at-gate)
+CV_ENABLED     = True      # False leaves both CV jacks disconnected from audio
+CV_GATE_INPUT  = 0         # CV1 jack: gate/trigger
+CV_PITCH_INPUT = 1         # CV2 jack: 1V/oct pitch
+CV_GATE_ON     = 2.5       # gate opens above this many volts...
+CV_GATE_OFF    = 1.25      # ...and closes below this (hysteresis)
+CV_GATE_VEL    = 1.0       # velocity (0..1) given to CV-gated notes
+CV_BASE_NOTE   = 60        # MIDI note that 0V on the pitch jack sounds
+CV_PITCH_TRIM_CENTS = 0.0  # + raises everything, - lowers (offset, cents)
+CV_PITCH_SCALE      = 1.0  # octaves added per volt (1.0 = a true 1V/oct)
+# AMY CV channel 0 is 'ext0' (coef index 7), channel 1 is 'ext1' (index 8).
+CV_PITCH_COEF = C_EXT0 if CV_PITCH_INPUT == 0 else C_EXT1
+CV_PITCH_COARSE_V = 0.0    # ATTEN knob (coarse volts of correction)
+CV_PITCH_OFFSET_V = 0.0    # OFFSET knob (fine volts of correction)
+CV_CAL_FILE = "/user/wt_cv_cal.json"
+_cv_cal_msg = "offset by ear"
+
+
+def cv_offset_volts():
+    """Total correction ADDED to the incoming pitch CV, in volts."""
+    return CV_PITCH_COARSE_V + CV_PITCH_OFFSET_V
+
+
+def cv_const_mult():
+    """Frequency multiplier carrying the CV offset, for the oscillator const.
+
+    THIS is what makes OFFSET audible in 'track' mode: the correction cannot
+    ride the ext coefficient (a pure multiplier, no offset term), so it folds
+    into the per-oscillator const, on the path retune() re-pushes on every
+    edit.  'gate' mode bakes the whole sum into the note instead, so it must
+    NOT be applied here too (that would count it twice)."""
+    if CV_ENABLED and CV_PITCH_MODE == 'track':
+        return 2.0 ** (CV_PITCH_SCALE * cv_offset_volts())
+    return 1.0
+
+
+def cv_pitch_coefs():
+    """(ext0, ext1) freq coefficients carrying the pitch jack, 'track' only.
+
+    In 'gate' mode the pitch is baked into the note at the gate edge, so this
+    MUST stay zero there or the CV is counted twice."""
+    if not (CV_ENABLED and CV_PITCH_MODE == 'track'):
+        return 0.0, 0.0
+    return ((CV_PITCH_SCALE, 0.0) if CV_PITCH_COEF == C_EXT0
+            else (0.0, CV_PITCH_SCALE))
+
+
+def cv_base_note():
+    """The note a RAW reading of 0V sounds, as a fractional MIDI note.
+
+    Uncalibrated (offset 0, scale 1) this is just BASE + TRIM.  In 'gate' mode
+    the measured offset also rides here (AMY bakes volts into the note at the
+    edge); in 'track' mode it rides the oscillator const instead."""
+    n = CV_BASE_NOTE + CV_PITCH_TRIM_CENTS / 100.0
+    if CV_PITCH_MODE == 'gate':
+        n += 12.0 * CV_PITCH_SCALE * cv_offset_volts()
+    return n
+
+
+def cv_note_for(raw):
+    """The MIDI note a raw pitch reading currently maps to (for the display)."""
+    return (CV_BASE_NOTE + CV_PITCH_TRIM_CENTS / 100.0
+            + 12.0 * CV_PITCH_SCALE * (raw + cv_offset_volts()))
 
 
 # --------------------------------------------------------------------------
@@ -477,6 +557,10 @@ P = {
     "eq_l": 0.0, "eq_m": 0.0, "eq_h": 0.0,
     # ---- tempo (for MOD tempo sync) --------------------------------------
     "tempo": 120.0,
+    # ---- CV CAL page (mirror the CV_* module constants) ------------------
+    # These describe THIS rig's CV, not a sound, so they are never stored in a
+    # patch (see PATCH_SKIP) -- they live in their own calibration file.
+    "cvoff": 0.0, "cvatt": 0.0, "cvgate": 2.5, "cvnote": 60,
 }
 
 # The modulation matrix: {(slot, dest_id): amount}.  Sparse on purpose -- only
@@ -1206,6 +1290,16 @@ def osc_freq_coefs(which, v):
     c[C_NOTE] = 1.0
     c[C_BEND] = 1.0
     const = _apply_routings(c, which + "_pit", const, 'oct')
+    # CV IN (track mode): the 1V/oct pitch jack rides ext0/ext1, and the
+    # OFFSET/ATTEN correction folds into the const (cv_const_mult).  Both are
+    # no-ops -- ext left unset, mult 1.0 -- when CV is disabled or in gate mode,
+    # so this line changes nothing for a MIDI-only setup.
+    e0, e1 = cv_pitch_coefs()
+    if e0:
+        c[C_EXT0] = e0
+    if e1:
+        c[C_EXT1] = e1
+    const *= cv_const_mult()
     # A freq const of 0 is ZERO_HZ_LOG_VAL (silence), not "no offset".
     c[C_CONST] = max(1.0, const)
     return coef_str(c)
@@ -1676,6 +1770,7 @@ def apply_rebuild():
     phases it arms."""
     all_off()
     build_all(full=True)
+    setup_cv()          # a full rebuild resets the oscillators; re-arm the gate
 
 
 def apply_none():
@@ -1684,12 +1779,161 @@ def apply_none():
     return
 
 
+# --------------------------------------------------------------------------
+#  CV ENGINE  (ported from megatron_v1, adapted to the 4-synth voice model)
+# --------------------------------------------------------------------------
+#  CV drives VOICE 0 -- its SILENT head takes the note, which AMY propagates
+#  down the chain to OSC A/B, firing their envelopes exactly as a MIDI note
+#  does.  A eurorack rig is monophonic, so one voice is the right amount; in
+#  UNISON/POLY the other three voices remain available to MIDI.
+CV_SYNTH = None                 # resolved to VOICE_SYNTHS[0] at first use
+_cal_dirty = False
+
+
+def _cv_synth():
+    global CV_SYNTH
+    if CV_SYNTH is None:
+        CV_SYNTH = VOICE_SYNTHS[0]
+    return CV_SYNTH
+
+
+def _cv_send(what, **kwargs):
+    # A malformed/unsupported send (e.g. older AMY without cv_trigger) can
+    # never take down MIDI/menu handling.
+    try:
+        _amy_send(**kwargs)
+    except Exception as e:
+        print("CV %s send failed:" % what, e)
+
+
+def setup_cv():
+    """Register the gate as a pair of AMY 'cv_trigger' mappings (audio-thread).
+
+    One trigger per edge direction, each on its own hysteresis pair, because a
+    single cv_trigger only fires in one direction.  The note is addressed to
+    voice 0's HEAD -- a chained oscillator refuses notes, so the head is the
+    only member that can take one, and it propagates the note down the chain."""
+    if not CV_ENABLED:
+        return
+    sy = _cv_synth()
+    note_off_msg = "i%dv%dl0" % (sy, HEAD)
+    if CV_PITCH_MODE == 'gate':
+        # Hand cv_trigger the pitch CV too, so AMY samples it at the gate edge
+        # and substitutes the note for '%v'.  The sampled note is relative to
+        # AMY note 69, hence the -69 and /12 converting our base note.
+        note_on_msg = "i%dv%dl%gn%%v" % (sy, HEAD, CV_GATE_VEL)
+        pitch_args = ",%d,%g,%g" % (CV_PITCH_INPUT, CV_PITCH_SCALE,
+                                    (cv_base_note() - 69.0) / 12.0)
+    else:
+        # 'track': the note carries only the base pitch; the CV itself rides
+        # the oscillators' ext freq coefficient continuously (cv_pitch_coefs).
+        note_on_msg = "i%dv%dl%gn%g" % (sy, HEAD, CV_GATE_VEL, cv_base_note())
+        pitch_args = ""
+    _cv_send("gate-on", synth=sy,
+             cv_trigger="%d,%g,%g%s,%s" % (CV_GATE_INPUT, CV_GATE_ON,
+                                           CV_GATE_OFF, pitch_args, note_on_msg))
+    # The note-off trigger never needs pitch args -- it only releases the voice.
+    _cv_send("gate-off", synth=sy,
+             cv_trigger="%d,%g,%g,%s" % (CV_GATE_INPUT, CV_GATE_OFF,
+                                         CV_GATE_ON, note_off_msg))
+
+
+def push_cv_pitch():
+    """Make the current OFFSET/SCALE audible RIGHT NOW.
+
+    The SCALE lives on the oscillators' ext freq coefficient and the OFFSET on
+    the const; retune() re-pushes both to every voice, and setup_cv() re-arms
+    the gate template so a change lands before the next gate too."""
+    setup_cv()
+    retune()
+
+
+def save_cv_cal():
+    """Persist the calibration.  Never raises -- flash faults must not disturb
+    audio or MIDI."""
+    try:
+        with open(CV_CAL_FILE, "w") as f:
+            json.dump({"offset": CV_PITCH_OFFSET_V, "coarse": CV_PITCH_COARSE_V,
+                       "gate_on": CV_GATE_ON, "base": CV_BASE_NOTE}, f)
+        return True
+    except Exception as e:
+        print("cv cal write failed:", e)
+        return False
+
+
+def load_cv_cal():
+    """Restore the calibration at boot.  A missing file is the normal first run."""
+    global CV_PITCH_OFFSET_V, CV_PITCH_COARSE_V, CV_GATE_ON, CV_GATE_OFF
+    global CV_BASE_NOTE
+    try:
+        with open(CV_CAL_FILE) as f:
+            d = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(d, dict):
+        return False
+    try:
+        CV_PITCH_OFFSET_V = float(d.get("offset", CV_PITCH_OFFSET_V))
+        CV_PITCH_COARSE_V = float(d.get("coarse", CV_PITCH_COARSE_V))
+        CV_GATE_ON = float(d.get("gate_on", CV_GATE_ON))
+        CV_GATE_OFF = CV_GATE_ON * 0.5
+        CV_BASE_NOTE = int(d.get("base", CV_BASE_NOTE))
+    except Exception as e:
+        print("cv cal load failed:", e)
+        return False
+    # Mirror the loaded constants into the page's P values.
+    P["cvoff"] = CV_PITCH_OFFSET_V
+    P["cvatt"] = CV_PITCH_COARSE_V
+    P["cvgate"] = CV_GATE_ON
+    P["cvnote"] = CV_BASE_NOTE
+    return True
+
+
+def apply_cvcal():
+    """CV CAL page handler.
+
+    Every control is a plain live setting -- turn it, hear it.  The values read
+    out of P into the module constants the CV engine uses, then push to AMY
+    immediately.  Persistence is deferred to page-change (flash writes are slow
+    and these are knobs you sweep)."""
+    global CV_PITCH_OFFSET_V, CV_PITCH_COARSE_V, CV_GATE_ON, CV_GATE_OFF
+    global CV_BASE_NOTE, _cal_dirty, _cv_cal_msg
+    changed = False
+    if CV_PITCH_OFFSET_V != P["cvoff"]:
+        CV_PITCH_OFFSET_V = P["cvoff"]
+        changed = True
+    if CV_PITCH_COARSE_V != P["cvatt"]:
+        CV_PITCH_COARSE_V = P["cvatt"]
+        changed = True
+    if CV_GATE_ON != P["cvgate"]:
+        CV_GATE_ON = P["cvgate"]
+        CV_GATE_OFF = CV_GATE_ON * 0.5   # release follows at half; one knob
+        changed = True
+    if CV_BASE_NOTE != int(P["cvnote"]):
+        CV_BASE_NOTE = int(P["cvnote"])
+        changed = True
+    if changed:
+        _cv_cal_msg = "trim %+.2fV" % cv_offset_volts()
+        push_cv_pitch()
+        _cal_dirty = True
+
+
+def cv_cal_save_if_dirty():
+    """Flush a changed calibration to flash.  Called on page change."""
+    global _cal_dirty
+    if _cal_dirty:
+        save_cv_cal()
+        _cal_dirty = False
+
+
+
+
 APPLY = {
     "a": apply_osc_a, "b": apply_osc_b, "head": apply_head,
     "ab": apply_ab, "rebuild": apply_rebuild, "none": apply_none,
     "m1": apply_mod1, "m2": apply_mod2, "mx": apply_matrix,
     "env": apply_env, "fx": apply_fx, "sys": apply_sys,
-    "uni": apply_unison, "mode": apply_mode,
+    "uni": apply_unison, "mode": apply_mode, "cvcal": apply_cvcal,
 }
 
 
@@ -1834,6 +2078,7 @@ def panic():
     build_all(full=True)
     apply_fx()
     apply_sys()
+    setup_cv()
 
 
 # --------------------------------------------------------------------------
@@ -2020,6 +2265,16 @@ PAGES = [
         ("EQ HIGH", "eq_h",  -15.0, 15.0, 1,    'f', 'fx'),
         ("TEMPO",  "tempo",   40.0, 240.0, 1,   'f', 'm1'),
     ]),
+    # Eurorack CV input, calibrated by ear.  CV1 = gate/trigger, CV2 = 1V/oct
+    # pitch.  Turn OFFSET so 0V sounds the 0V NOTE, ATTEN for the last few
+    # cents, GATE V to clear an unpatched jack's float.  The pane above shows
+    # both jacks live and the note CV2 currently resolves to.
+    ("CV CAL", [
+        ("ATTEN",   "cvatt",  -2.0, 2.0, 0.20, 'f', 'cvcal'),
+        ("OFFSET",  "cvoff",  -2.0, 2.0, 0.01, 'f', 'cvcal'),
+        ("GATE V",  "cvgate",  0.2, 5.0, 0.1,  'f', 'cvcal'),
+        ("0V NOTE", "cvnote",  0, 127,   1,    'i', 'cvcal'),
+    ]),
 ]
 
 # 4-character grid labels, keyed by parameter so a control that appears on two
@@ -2057,6 +2312,7 @@ SHORT = {
     "rv_lvl": "REVB", "rv_live": "LIVE", "rv_damp": "DAMP",
     "rv_xover": "XOVR", "eq_l": "EQ.L", "eq_m": "EQ.M", "eq_h": "EQ.H",
     "tempo": "BPM",
+    "cvatt": "ATTN", "cvoff": "OFFS", "cvgate": "GATE", "cvnote": "0V.N",
 }
 
 
@@ -2272,7 +2528,9 @@ MAX_PATCHES = 24
 # Momentary actions and the matrix cursor are UI state, not sound: saving them
 # would fire a PANIC (or move somebody's cursor) on every load of that patch.
 PATCH_SKIP = ("panic", "mx_clr", "mx_clrall", "mx_slot", "mx_dest", "mx_amt",
-              "wt_src", "wt_browse", "wt_load", "wt_scan_act")
+              "wt_src", "wt_browse", "wt_load", "wt_scan_act",
+              # CV calibration is rig-specific, not part of a sound.
+              "cvoff", "cvatt", "cvgate", "cvnote")
 
 DEFAULTS = dict(P)
 DEFAULT_MATRIX = dict(MATRIX)
@@ -2353,6 +2611,7 @@ def _apply_patch(rec):
     build_all(full=True)
     apply_fx()
     apply_sys()
+    setup_cv()          # a full rebuild resets the oscillators; re-arm the gate
     P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
     return True
 
@@ -3057,21 +3316,112 @@ def draw_vis_drive(d, y0, h):
 
 
 def _bars(d, y0, h, items):
-    """A labelled bar per (name, 0..1) pair -- used by the two FX pages."""
+    """A labelled bar per (name, 0..1) pair -- used by the two FX pages.
+
+    The track is an OUTLINE, not a filled rectangle.  On the 1-bit SH1107 any
+    non-zero colour is white, so a solid track (even at the dimmest level) reads
+    as a FULL white bar -- which is exactly the "bars look full by default" bug.
+    An outline reads as an empty bar that fills from the left with white as the
+    value rises, matching the grid cells below."""
     y_hi = y0 + h
     d.fill_rect(0, y0, SCREEN_W, h, 0)
     n = len(items)
     if n == 0:
         return
     rh = max(6, h // n)
+    bx = 5 * CHAR_W
+    bw = SCREEN_W - bx - 3
     for i in range(n):
         name, v = items[i]
         y = y0 + i * rh
+        bh = rh - 3
         d.text(name[:4], 1, y, C_DIM)
-        bx = 5 * CHAR_W
-        bw = SCREEN_W - bx - 3
-        _vrect(d, bx, y + 1, bw, rh - 3, C_PAGE_OFF, y0, y_hi)
-        _vrect(d, bx, y + 1, int(bw * clamp(v, 0.0, 1.0)), rh - 3, C_VIS, y0, y_hi)
+        # Empty outline box (thin lines, so it never reads as "full").
+        _vrect(d, bx, y + 1, bw, 1, C_BAR_OUT, y0, y_hi)
+        _vrect(d, bx, y + bh, bw, 1, C_BAR_OUT, y0, y_hi)
+        _vrect(d, bx, y + 1, 1, bh, C_BAR_OUT, y0, y_hi)
+        _vrect(d, bx + bw - 1, y + 1, 1, bh, C_BAR_OUT, y0, y_hi)
+        # Fill proportional to the value, inset one pixel inside the outline.
+        fw = int((bw - 2) * clamp(v, 0.0, 1.0))
+        if fw > 0:
+            _vrect(d, bx + 1, y + 2, fw, bh - 2, C_VIS, y0, y_hi)
+
+
+# ---- CV CAL visual pane (ported from megatron_v1) -------------------------
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+CV_VIS_MS = 250
+_cv_vis_t = 0
+_cv_vis_last = (None, None)
+_cv_vis_fault = False
+
+
+def _note_name(n):
+    """Fractional MIDI note -> e.g. "C4+7" (nearest name, octave, cents off)."""
+    if n < 0 or n > 127:
+        return "--"
+    nearest = int(round(n))
+    cents = int(round((n - nearest) * 100.0))
+    nm = NOTE_NAMES[nearest % 12] + "%d" % (nearest // 12 - 1)
+    if cents:
+        nm += "%+d" % cents
+    return nm
+
+
+def _vtext(d, s, x, y, col, y0, y_hi):
+    """Text clipped to the panel: an over-wide .text() writes outside the
+    framebuffer rather than truncating, so every variable-length readout on
+    the visual pane goes through here."""
+    if y < y0 or y + 8 > y_hi:
+        return
+    room = (SCREEN_W - x) // CHAR_W
+    if room > 0:
+        d.text(s[:room], x, y, col)
+
+
+def cv_read_both():
+    """(gate_v, pitch_v) for the display, throttled.  (None, None) if no cv_in."""
+    global _cv_vis_t, _cv_vis_last, _cv_vis_fault
+    now = _now()
+    if _cv_vis_last[0] is not None and _dt(now, _cv_vis_t) < CV_VIS_MS:
+        return _cv_vis_last
+    try:
+        g = amyboard.cv_in(CV_GATE_INPUT)
+        v = amyboard.cv_in(CV_PITCH_INPUT)
+    except Exception as e:
+        if not _cv_vis_fault:
+            _cv_vis_fault = True
+            print("CV display: cv_in() unavailable:", e)
+        return None, None
+    _cv_vis_t = now
+    _cv_vis_last = (g, v)
+    return g, v
+
+
+def draw_vis_cvcal(d, y0, h):
+    """Live CV, the trigger state, and where the calibration currently stands.
+
+    Both jacks are shown and labelled BY JACK: if you gate CV1 and the CV1 line
+    does not move, the problem is which physical jack maps to which AMY
+    channel, and no threshold tuning will fix that."""
+    y_hi = y0 + h
+    _vrect(d, 0, y0, SCREEN_W, h, 0, y0, y_hi)   # this pane redraws live
+    gv, pv = cv_read_both()
+    if gv is None:
+        _vtext(d, "no cv_in()", 2, y0 + h // 2 - 4, C_VIS, y0, y_hi)
+        return
+    # CV1 gate: RAW volts (AMY thresholds against the raw reading), with the
+    # threshold and live trigger state alongside so the margin is visible.
+    _vtext(d, "CV1 %+.2f>%.1f %s" % (clamp(gv, -9.9, 9.9), CV_GATE_ON,
+                                     "TRIG" if gv >= CV_GATE_ON else "--"),
+           2, y0 + 1, C_VIS, y0, y_hi)
+    # CV2 pitch: CORRECTED volts (raw + ATTEN + OFFSET), the number the synth
+    # actually plays from, plus the note it resolves to.
+    corr = pv + cv_offset_volts()
+    _vtext(d, "CV2 %+.2fV %s" % (clamp(corr, -9.9, 9.9),
+                                 _note_name(cv_note_for(pv))),
+           2, y0 + 10, C_VIS, y0, y_hi)
+    _vtext(d, "raw %+.2f trim%+.2f" % (clamp(pv, -9.9, 9.9), cv_offset_volts()),
+           2, y0 + 19, C_VIS, y0, y_hi)
 
 
 def draw_visual(d):
@@ -3114,6 +3464,8 @@ def draw_visual(d):
     elif name == "REVERB":
         _bars(d, y0, h, [("REVB", P["rv_lvl"]), ("LIVE", P["rv_live"]),
                          ("DAMP", P["rv_damp"])])
+    elif name == "CV CAL":
+        draw_vis_cvcal(d, y0, h)
 
 
 # --------------------------------------------------------------------------
@@ -3340,6 +3692,9 @@ def draw_splash(d):
 
 def _goto_page(p):
     global page, cursor, editing, need_redraw, pmode
+    # Leaving a page flushes a pending CV calibration to flash (deferred there
+    # so sweeping the OFFSET knob does not hammer the card).
+    cv_cal_save_if_dirty()
     page = p % N_PAGES
     cursor = 0
     editing = False
@@ -3704,6 +4059,76 @@ def wt_try(path):
         print("decode FAILED: %s" % e)
 
 
+# --- CV diagnostics (REPL only) --------------------------------------------
+_cv_cal_pts = []
+
+
+def cv_read(samples=32, gap_ms=5):
+    """Average the pitch jack (CV2) over many reads, for calibration."""
+    total = 0.0
+    n = 0
+    for _ in range(samples):
+        try:
+            total += amyboard.cv_in(CV_PITCH_INPUT)
+        except Exception as e:
+            print("cv_read: cv_in() failed:", e)
+            return None
+        n += 1
+        try:
+            time.sleep_ms(gap_ms)
+        except AttributeError:
+            time.sleep(gap_ms / 1000.0)
+    return total / n if n else None
+
+
+def cv_cal(note=None, samples=32):
+    """Fit BASE / TRIM / SCALE from two measured points.  cv_cal() clears.
+
+    Hold a low note into the pitch jack, call cv_cal(<midi note>); hold a note
+    2+ octaves away, call cv_cal(<that note>).  Prints the three CV_* constants
+    to paste into the block at the top of the sketch (or dial in on CV CAL)."""
+    global _cv_cal_pts
+    if note is None:
+        _cv_cal_pts = []
+        print("CV cal: cleared. Hold a low note, then cv_cal(<note number>).")
+        return
+    v = cv_read(samples)
+    if v is None:
+        return
+    _cv_cal_pts.append((v, float(note)))
+    print("CV cal: point %d -- %.4f V = note %g" % (len(_cv_cal_pts), v, note))
+    if len(_cv_cal_pts) < 2:
+        print("  now hold a note 2+ octaves away and call cv_cal(<that note>).")
+        return
+    v0, n0 = _cv_cal_pts[0]
+    v1, n1 = _cv_cal_pts[-1]
+    if abs(v1 - v0) < 0.05:
+        print("  points too close in voltage to fit -- use a wider interval.")
+        return
+    scale = ((n1 - n0) / 12.0) / (v1 - v0)
+    base = n0 - 12.0 * scale * v0
+    base_i = int(round(base))
+    print("  CV_BASE_NOTE        = %d" % base_i)
+    print("  CV_PITCH_TRIM_CENTS = %.1f" % ((base - base_i) * 100.0))
+    print("  CV_PITCH_SCALE      = %.4f" % scale)
+
+
+def cv_status():
+    """Live look at both jacks -- the quickest check that CV is arriving."""
+    try:
+        g = amyboard.cv_in(CV_GATE_INPUT)
+        v = amyboard.cv_in(CV_PITCH_INPUT)
+    except Exception as e:
+        print("cv_in() unavailable:", e)
+        return
+    print("CV%d gate  %+.3f V  (on>%.2f off<%.2f)  %s"
+          % (CV_GATE_INPUT + 1, g, CV_GATE_ON, CV_GATE_OFF,
+             "TRIGGERED" if g >= CV_GATE_ON else "idle"))
+    print("CV%d pitch %+.3f V  raw -> %s  (trim %+.3fV, %s mode)"
+          % (CV_PITCH_INPUT + 1, v, _note_name(cv_note_for(v)),
+             cv_offset_volts(), CV_PITCH_MODE))
+
+
 def sd_ls(dirpath=None, depth=0):
     """Raw recursive listing of the SD card, for diagnosing an empty scan.
 
@@ -3810,6 +4235,15 @@ def boot():
           % (n, WT_BUILTIN_COUNT - 1))
     wt_remember_selection()
 
+    # CV calibration is restored BEFORE the voices are built, so the loaded
+    # scale/offset are already in the freq coefficients the first build emits.
+    try:
+        if load_cv_cal():
+            print("cv cal loaded: trim %+.3fV, base note %d"
+                  % (cv_offset_volts(), CV_BASE_NOTE))
+    except Exception as e:
+        print("cv cal load failed:", e)
+
     try:
         build_all(full=True)
     except Exception as e:
@@ -3819,6 +4253,13 @@ def boot():
         apply_sys()
     except Exception as e:
         print("fx/sys failed:", e)
+    # Register the CV gate/pitch mappings (audio-thread; harmless without a rig).
+    try:
+        setup_cv()
+        print("CV in: %s mode, gate CV%d, pitch CV%d"
+              % (CV_PITCH_MODE, CV_GATE_INPUT + 1, CV_PITCH_INPUT + 1))
+    except Exception as e:
+        print("setup_cv failed:", e)
 
     P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
 
@@ -3856,7 +4297,7 @@ def boot():
 
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
-    print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) wt_try(p)")
+    print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) cv_status()")
     need_redraw = True
 
 
@@ -3890,6 +4331,14 @@ def loop(*args):
                 _scope_t = now
                 draw_scope(amyboard.display)
                 display_refresh()
+        elif (HAVE_BOARD and DISPLAY_OK and not is_patch_page()
+              and PAGES[page][0] == "CV CAL"):
+            # The CV jacks move without any user input, so a need_redraw-gated
+            # readout would sit stale.  Only the pane is redrawn, and the
+            # reading behind it is throttled (CV_VIS_MS).
+            y0, h = vis_band()
+            draw_vis_cvcal(amyboard.display, y0, h)
+            display_refresh()
     except Exception as e:
         # loop() runs every ~60 ms: print the real traceback once, then stay
         # quiet, or a recurring fault floods the console and buries the one
