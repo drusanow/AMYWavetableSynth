@@ -45,19 +45,30 @@ the **WT LOAD** page. Select the target oscillator, browse the card, load:
 | **FILE** | browse the found files |
 | **LOAD** | streams the chosen file into RAM, adds it to the `TABLE` knob's catalogue and selects it on the target oscillator |
 
-The files are **16-bit PCM WAV** (that's what "PCM file" means here — the same
-format as any sample). A loaded table then behaves like any built-in — it stays
-on the `TABLE` knob, and a patch that references it stores it **by full path**.
-Loading verifies the file first, so a too-short or corrupt one reports
-`LOAD FAILED` instead of going silent. PR
-[shorepine/amy#997](https://github.com/shorepine/amy/pull/997) means **any
-`.wav` of at least 512 samples works**, not only purpose-built tables — ordinary
-one-shot samples are fair game.
+**WAV formats.** AMY's own `load_sample` only reads 16-bit *integer* PCM and
+rejects everything else — which is why float files "wouldn't load". The sketch
+therefore decodes WAVs itself and accepts the formats wavetable tools actually
+export:
 
-If **SCAN SD finds nothing**, run `sd_ls()` at the REPL: it prints the raw card
-contents (all files and folders) so you can confirm the card is mounted and see
-where your files actually are. `wt_scan()` prints the full path of every `.wav`
-the scan matched.
+- 8 / 16 / 24 / 32-bit **integer PCM**
+- **32-bit IEEE float** (Serum, Vital, WaveEdit, most DAWs)
+- **WAVE_FORMAT_EXTENSIBLE** (the usual "32-bit float" container)
+- mono or stereo (stereo is downmixed to mono)
+
+Each file is converted to 16-bit mono, trimmed to whole 256-sample cycles, and
+streamed into AMY. Any `.wav` of at least 512 samples works
+([shorepine/amy#997](https://github.com/shorepine/amy/pull/997)), so ordinary
+one-shot samples are fair game too, not only purpose-built tables. A loaded
+table behaves like any built-in — it stays on the `TABLE` knob, and a patch that
+references it stores it **by full path**. Loading is verified first, so a bad
+file reports the actual reason (e.g. `fmt 0x11 unsupported`, `too short`)
+instead of going silent.
+
+**Diagnostics** (REPL): `wt_wavinfo("/sd/path.wav")` prints a file's real format,
+channels, bit depth and cycle count and whether it's loadable; `wt_try(path)`
+attempts a decode and reports the outcome. If **SCAN SD finds nothing**,
+`sd_ls()` prints the raw card contents so you can confirm the mount and locate
+files; `wt_scan()` prints the full path of every `.wav` matched.
 
 When you load a patch that names an SD table, the synth resolves it directly by
 path; if the file is gone it falls back to a built-in and says so.

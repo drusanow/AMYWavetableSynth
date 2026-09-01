@@ -54,6 +54,7 @@ import math
 import json
 import array
 import os
+import struct
 
 try:
     import amyboard
@@ -785,6 +786,171 @@ def wt_index_of_path(path):
     return -1
 
 
+# --------------------------------------------------------------------------
+#  WAV DECODING  --  read ANY common WAV, not just 16-bit integer PCM
+# --------------------------------------------------------------------------
+#  This is the fix for "unable to load".  amy.load_sample() parses the file
+#  through amy.wave, whose _read_fmt_chunk RAISES on anything but
+#  WAVE_FORMAT_PCM (0x0001) -- so a 32-bit float or WAVE_FORMAT_EXTENSIBLE
+#  file (what Serum, Vital, WaveEdit and most DAWs export) fails outright.
+#
+#  So we decode the WAV ourselves: 8/16/24/32-bit integer PCM, 32-bit IEEE
+#  float, and EXTENSIBLE (whose real format is its SubFormat GUID) are all
+#  accepted, stereo is downmixed to mono, and the result is handed to AMY as
+#  plain 16-bit mono frames via load_sample_bytes -- the format wave=WAVETABLE
+#  wants.  Anything genuinely unusable raises a ValueError with a short reason
+#  the UI can show.
+WT_LOAD_MAX_FRAMES = 1 << 16    # cap so a multi-MB sample can't OOM the load
+_wt_last_error = ""             # reason string from the most recent failed load
+
+_WAV_FMT_PCM = 0x0001
+_WAV_FMT_FLOAT = 0x0003
+_WAV_FMT_EXTENSIBLE = 0xFFFE
+
+
+def _wav_read_header(f):
+    """Parse RIFF/WAVE header. Returns (fmt_tag, nch, sr, bits, data_pos,
+    data_size).  Raises ValueError with a short reason on anything malformed."""
+    riff = f.read(12)
+    if len(riff) < 12 or riff[0:4] != b'RIFF' or riff[8:12] != b'WAVE':
+        raise ValueError("not a WAV")
+    fmt_tag = None
+    nch = 1
+    sr = 44100
+    bits = 16
+    while True:
+        hdr = f.read(8)
+        if len(hdr) < 8:
+            break
+        cid = hdr[0:4]
+        csize = struct.unpack('<I', hdr[4:8])[0]
+        if cid == b'fmt ':
+            fmt = f.read(csize)
+            if len(fmt) < 16:
+                raise ValueError("bad fmt chunk")
+            fmt_tag, nch, sr, _br, _al, bits = struct.unpack('<HHIIHH', fmt[:16])
+            if fmt_tag == _WAV_FMT_EXTENSIBLE and len(fmt) >= 26:
+                # The real format lives in the first 2 bytes of the SubFormat GUID.
+                fmt_tag = struct.unpack('<H', fmt[24:26])[0]
+            if csize & 1:
+                f.read(1)
+        elif cid == b'data':
+            return fmt_tag, nch, sr, bits, f.tell(), csize
+        else:
+            # Skip any other chunk (LIST/INFO/cue/smpl/...), honouring padding.
+            f.seek(csize + (csize & 1), 1)
+    raise ValueError("no data chunk")
+
+
+def _wav_to_mono16(path):
+    """Decode `path` to (mono 16-bit LE bytes, samplerate, nframes).
+
+    Trims to a whole number of 256-sample cycles so the wavetable crossfade
+    lands cleanly, and caps overly long files.  Raises ValueError on an
+    unreadable or unsupported file."""
+    f = open(path, 'rb')
+    try:
+        fmt_tag, nch, sr, bits, data_pos, data_size = _wav_read_header(f)
+        if fmt_tag is None:
+            raise ValueError("no fmt chunk")
+        bytes_per = (bits + 7) // 8
+        frame_bytes = nch * bytes_per
+        if frame_bytes == 0:
+            raise ValueError("bad WAV header")
+        nframes = data_size // frame_bytes
+        if nframes > WT_LOAD_MAX_FRAMES:
+            nframes = WT_LOAD_MAX_FRAMES
+        nframes = (nframes // WT_CYCLE) * WT_CYCLE     # whole cycles only
+        if nframes < WT_MIN_SAMPLES:
+            raise ValueError("too short (<512 smp)")
+
+        is_float = (fmt_tag == _WAV_FMT_FLOAT)
+        is_pcm = (fmt_tag == _WAV_FMT_PCM)
+        if not (is_pcm or is_float):
+            raise ValueError("fmt 0x%X unsupported" % fmt_tag)
+        if is_float and bytes_per != 4:
+            raise ValueError("float%d unsupported" % bits)
+
+        f.seek(data_pos)
+        # Fast path: already 16-bit mono PCM -- copy the bytes straight through.
+        if is_pcm and bits == 16 and nch == 1:
+            return f.read(nframes * 2), sr, nframes
+
+        out = bytearray(nframes * 2)
+        oi = 0
+        remaining = nframes
+        BLK = 1024
+        while remaining > 0:
+            n = BLK if remaining > BLK else remaining
+            raw = f.read(n * frame_bytes)
+            got = len(raw) // frame_bytes
+            if got == 0:
+                break
+            if got < n:
+                n = got
+            for fr in range(n):
+                base = fr * frame_bytes
+                acc = 0
+                for ch in range(nch):
+                    o = base + ch * bytes_per
+                    if is_float:
+                        v = struct.unpack_from('<f', raw, o)[0]
+                        s = int(max(-1.0, min(1.0, v)) * 32767.0)
+                    elif bytes_per == 2:
+                        s = struct.unpack_from('<h', raw, o)[0]
+                    elif bytes_per == 1:
+                        s = (raw[o] - 128) << 8          # 8-bit WAV is unsigned
+                    elif bytes_per == 3:
+                        val = raw[o] | (raw[o + 1] << 8) | (raw[o + 2] << 16)
+                        if val & 0x800000:
+                            val -= 1 << 24
+                        s = val >> 8
+                    elif bytes_per == 4:
+                        s = struct.unpack_from('<i', raw, o)[0] >> 16
+                    else:
+                        raise ValueError("bit depth %d" % bits)
+                    acc += s
+                s = acc // nch
+                if s > 32767:
+                    s = 32767
+                elif s < -32768:
+                    s = -32768
+                out[oi] = s & 0xFF
+                out[oi + 1] = (s >> 8) & 0xFF
+                oi += 2
+            remaining -= n
+        return bytes(out[:oi]), sr, oi // 2
+    finally:
+        f.close()
+
+
+def _wt_stream_file(path, slot):
+    """Decode `path` and stream it into AMY preset `slot` as a wavetable.
+
+    Returns the frame count on success.  Raises ValueError (with a short
+    reason) on any failure -- caller blacklists and reports it."""
+    mono, sr, nframes = _wav_to_mono16(path)
+    if nframes < WT_MIN_SAMPLES:
+        raise ValueError("too short (<512 smp)")
+    # load_sample_bytes is the public path that handles the wire/transfer
+    # chunking; fall back to the raw header+chunk protocol if a stripped build
+    # doesn't expose it.
+    lsb = getattr(amy, "load_sample_bytes", None)
+    if lsb is not None:
+        lsb(mono, preset=slot, midinote=60, sr=sr)
+    else:
+        amy.send(load_sample="%d,%d,%d,60,0,0" % (slot, nframes, sr))
+        b64 = getattr(amy, "b64", None)
+        chunk = getattr(amy, "_send_transfer_chunk", None) or amy.send_raw
+        if b64 is None:
+            import binascii
+            b64 = lambda b: binascii.b2a_base64(b)[:-1]
+        step = 188
+        for i in range(0, len(mono), step):
+            chunk(b64(mono[i:i + step]).decode('ascii'))
+    return nframes
+
+
 def _wt_claim_slot(path):
     """Reserve a preset slot for `path`, evicting the least-recently-used.
 
@@ -830,34 +996,31 @@ def wt_preset_for(idx):
         return builtin
     if path in _wt_failed:
         return None
+    if not _file_exists(path):
+        _wt_note_fail(path, "missing file")
+        return None
     slot, loaded = _wt_claim_slot(path)
     if loaded:
         return slot
     try:
-        sz = os.stat(path)[6]
-    except Exception:
-        print("wt: missing", path)
-        _wt_failed.add(path)
-        _wt_slot_of.pop(path, None)
-        if path in _wt_slot_lru:
-            _wt_slot_lru.remove(path)
-        return None
-    # A WAV header is 44 bytes; anything that cannot hold two 256-sample cycles
-    # of 16-bit mono is not a wavetable AMY can crossfade.
-    if sz < 44 + WT_MIN_SAMPLES * 2:
-        print("wt: too short (%d bytes), need %d+" % (sz, 44 + WT_MIN_SAMPLES * 2))
-        _wt_failed.add(path)
-        return None
-    try:
-        amy.load_sample(path, preset=slot, midinote=60)
+        n = _wt_stream_file(path, slot)
+        print("wt: loaded %s -- %d frames into preset %d" % (path, n, slot))
     except Exception as e:
-        print("wt: load failed for", path, "--", e)
-        _wt_failed.add(path)
+        # The slot was reserved but nothing usable landed in it; release it so
+        # a later good table can reuse it, and remember why this one failed.
         _wt_slot_of.pop(path, None)
         if path in _wt_slot_lru:
             _wt_slot_lru.remove(path)
+        _wt_note_fail(path, str(e))
         return None
     return slot
+
+
+def _wt_note_fail(path, reason):
+    global _wt_last_error
+    _wt_last_error = reason
+    _wt_failed.add(path)
+    print("wt: cannot load %s -- %s" % (path, reason))
 
 
 def wt_preset_or_fallback(idx):
@@ -2084,7 +2247,8 @@ def _wt_load_selected():
     if wt_preset_for(idx) is None:
         if not existed:
             WT_CATALOG.pop()            # remove the fresh, failed append
-        toast("LOAD FAILED")
+        # Show the actual reason (bad format, too short, ...) not a bare fail.
+        toast((_wt_last_error or "load failed")[:16])
         return
     tgt = int(P["wt_src"])
     P["a_wt" if tgt == 0 else "b_wt"] = idx
@@ -3496,6 +3660,50 @@ def wt_scan():
     return n
 
 
+_WAV_FMT_NAMES = {0x0001: "PCM int", 0x0003: "IEEE float", 0xFFFE: "extensible"}
+
+
+def wt_wavinfo(path):
+    """Print a WAV file's real format -- what the decoder sees.
+
+    Use this when a load fails: it names the format tag, channels, bit depth
+    and frame count, so you can tell at a glance whether a file is float,
+    24-bit, stereo, too short, etc.  Reads only the header, loads nothing."""
+    try:
+        f = open(path, 'rb')
+    except Exception as e:
+        print("cannot open %s: %s" % (path, e))
+        return
+    try:
+        fmt_tag, nch, sr, bits, dpos, dsize = _wav_read_header(f)
+    except Exception as e:
+        print("%s: not readable -- %s" % (path, e))
+        f.close()
+        return
+    f.close()
+    bytes_per = (bits + 7) // 8
+    frames = dsize // (nch * bytes_per) if nch and bytes_per else 0
+    cycles = frames // WT_CYCLE
+    print("%s" % path)
+    print("  format : 0x%04X (%s)" % (fmt_tag, _WAV_FMT_NAMES.get(fmt_tag, "?")))
+    print("  channels %d, %d-bit, %d Hz" % (nch, bits, sr))
+    print("  %d frames = %d wavetable cycles (of 256)" % (frames, cycles))
+    ok = (fmt_tag in (0x0001, 0x0003)) and frames >= WT_MIN_SAMPLES
+    print("  loadable: %s" % ("YES" if ok else "NO"))
+
+
+def wt_try(path):
+    """Attempt to decode + load a WAV from the REPL, printing the outcome.
+
+    A direct way to test one file without going through the UI."""
+    try:
+        mono, sr, n = _wav_to_mono16(path)
+        print("decoded OK: %d mono frames @ %d Hz (%d bytes 16-bit)"
+              % (n, sr, len(mono)))
+    except Exception as e:
+        print("decode FAILED: %s" % e)
+
+
 def sd_ls(dirpath=None, depth=0):
     """Raw recursive listing of the SD card, for diagnosing an empty scan.
 
@@ -3648,7 +3856,7 @@ def boot():
 
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
-    print("REPL helpers: status()  wt_list()  wt_scan()  sd_ls()  wt_selftest()")
+    print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) wt_try(p)")
     need_redraw = True
 
 
