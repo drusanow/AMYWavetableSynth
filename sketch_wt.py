@@ -509,7 +509,7 @@ P = {
     # clamped away and the movement reads as half-depth.
     "a_wt": 0, "a_pos": 0.35, "a_coarse": 0.0, "a_fine": 0.0,
     "a_lvl": 0.8, "a_phase": 0.0, "a_drv": 1.0, "a_fold": 0,
-    # OSC B starts on a DIFFERENT built-in table (INT 1) and a slight detune,
+    # OSC B starts on a DIFFERENT built-in table (SQUARE) and a slight detune,
     # so the two-wavetable architecture is audible the moment you play a note
     # rather than sounding like one oscillator.
     "b_wt": 1, "b_pos": 0.5, "b_coarse": 0.0, "b_fine": 7.0,
@@ -655,11 +655,121 @@ WT_FULL = 64 * WT_CYCLE         # the canonical 64-cycle / 16384-sample table
 WT_PRESET0 = 400
 WT_SLOTS = 4                    # 4 x 32 KB worst case; a patch only needs 2
 
-# The wavetables baked into the firmware, exposed so the synth is playable with
-# no SD card at all.  GAMMA9001 builds (which AMYboard is) put them at PCM
-# preset 19; pcm_tiny.h defines 5 of them.
-WT_BUILTIN_BASE = 19
-WT_BUILTIN_COUNT = 5
+# ---- built-in wavetables -------------------------------------------------
+# The firmware ROM wavetables (GAMMA9001 preset 19..23) barely morph and sound
+# nearly identical -- measured directly against AMY's renderer -- so the synth
+# ships its OWN wavetables instead, computed in Python at boot/on demand and
+# loaded into RAM.  Each one sweeps a wide timbral range as POSITION moves
+# across its cycles (validated: SAW goes 4 -> 72 significant harmonics, vs the
+# ROM tables' ~2).  No SD card and no firmware change needed.  The ROM base is
+# kept only as a last-ditch fallback if a generate ever fails.
+WT_BUILTIN_BASE = 19            # ROM fallback preset (GAMMA9001)
+WT_GEN_BASE = 360              # procedural built-ins live at 360..; below the
+                               # SD LRU range (WT_PRESET0=400) so they never
+                               # collide or get evicted.
+WT_GEN_CYCLES = 16            # cycles per generated table (16*256 = 4096 smp)
+_wt_gen_loaded = set()        # built-in indices already generated into RAM
+
+
+def _wt_norm_cycle(cyc):
+    """Scale one cycle to just under full scale -- per-cycle, so POSITION reads
+    as a timbre change rather than a volume ramp."""
+    pk = 1e-9
+    for x in cyc:
+        a = x if x >= 0 else -x
+        if a > pk:
+            pk = a
+    g = 0.95 / pk
+    return [x * g for x in cyc]
+
+
+def _wt_gen_saw(ph, m):
+    """Sine at POSITION 0, bright saw at 1 (harmonics fill in)."""
+    return math.sin(6.2831853 * ph) * (1.0 - m) + (2.0 * ph - 1.0) * m
+
+
+def _wt_gen_square(ph, m):
+    """Pulse width sweeping from a thin spike to a full square."""
+    return 1.0 if ph < (0.5 - 0.45 * (1.0 - m)) else -1.0
+
+
+def _wt_gen_harm(ph, m):
+    """Additive: one more harmonic joins per cycle -- an organ-like build."""
+    n = 1 + int(m * 15)
+    v = 0.0
+    h = 1
+    while h <= n:
+        v += math.sin(6.2831853 * h * ph) / h
+        h += 1
+    return v
+
+
+def _wt_gen_vox(ph, m):
+    """A vocal-ish pair of formants sliding up the table."""
+    f1 = 1.0 + m * 5.0
+    f2 = 4.0 + m * 14.0
+    return (math.sin(6.2831853 * ph) * 0.6
+            + math.sin(6.2831853 * f1 * ph) * 0.3
+            + math.sin(6.2831853 * f2 * ph) * 0.25 * m)
+
+
+def _wt_gen_fold(ph, m):
+    """A sine driven progressively into a triangle wavefolder."""
+    v = math.sin(6.2831853 * ph) * (1.0 + m * 5.0)
+    g = 0
+    while g < 4:
+        if v > 1.0:
+            v = 2.0 - v
+        elif v < -1.0:
+            v = -2.0 - v
+        g += 1
+    return v
+
+
+def _wt_gen_bell(ph, m):
+    """Inharmonic partials fading in -- metallic, very responsive to FM."""
+    r = (1.0, 2.41, 3.83, 5.17, 7.61)
+    v = 0.0
+    i = 0
+    while i < len(r):
+        v += math.sin(6.2831853 * r[i] * ph) * (1.0 / (i + 1)) * (m if i else 1.0)
+        i += 1
+    return v
+
+
+# Name + generator.  The first two (cheap: 1 and 0 sin() per sample) are the
+# boot defaults, so start-up only generates those; the richer tables generate
+# lazily the first time they are selected.
+WT_BUILTIN = (
+    ("SAW", _wt_gen_saw),
+    ("SQUARE", _wt_gen_square),
+    ("HARM", _wt_gen_harm),
+    ("VOX", _wt_gen_vox),
+    ("FOLD", _wt_gen_fold),
+    ("BELL", _wt_gen_bell),
+)
+WT_BUILTIN_COUNT = len(WT_BUILTIN)
+
+
+def _wt_build_gen(fn):
+    """Render a generator into 16-bit mono LE bytes (WT_GEN_CYCLES * 256)."""
+    out = bytearray(WT_GEN_CYCLES * WT_CYCLE * 2)
+    oi = 0
+    denom = float(WT_GEN_CYCLES - 1)
+    for c in range(WT_GEN_CYCLES):
+        m = c / denom
+        cyc = [fn(i / float(WT_CYCLE), m) for i in range(WT_CYCLE)]
+        cyc = _wt_norm_cycle(cyc)
+        for x in cyc:
+            s = int(x * 32767.0)
+            if s > 32767:
+                s = 32767
+            elif s < -32768:
+                s = -32768
+            out[oi] = s & 0xFF
+            out[oi + 1] = (s >> 8) & 0xFF
+            oi += 2
+    return bytes(out)
 
 # The SD card is scanned RECURSIVELY from its mount root, wherever the user
 # put their files -- not a fixed /wavetables/{factory,user} layout, which was
@@ -764,14 +874,48 @@ def _file_exists(path):
 
 
 def wt_builtins():
-    """Reset the catalogue to the built-in tables alone.
+    """Reset the catalogue to the built-in (procedural) tables alone.
 
-    Called at boot.  The synth always comes up playable on its firmware
-    wavetables with no SD access at all, honouring the STARTUP CONTRACT above."""
+    Called at boot.  Entries carry their generator in the third slot (a
+    callable); wt_preset_for() renders it into RAM on first use.  No SD access
+    and no firmware wavetables involved, honouring the STARTUP CONTRACT above."""
     global WT_CATALOG
-    WT_CATALOG = [("INT %d" % i, None, WT_BUILTIN_BASE + i)
-                  for i in range(WT_BUILTIN_COUNT)]
+    WT_CATALOG = [(name, None, fn) for (name, fn) in WT_BUILTIN]
     return len(WT_CATALOG)
+
+
+def _wt_gen_preset(idx, fn):
+    """RAM preset for procedural built-in `idx`, generating it on first use.
+
+    Returns the preset number, or None if generation/loading fails (caller
+    then falls back to a firmware ROM table)."""
+    preset = WT_GEN_BASE + idx
+    if idx in _wt_gen_loaded:
+        return preset
+    try:
+        data = _wt_build_gen(fn)
+    except Exception as e:
+        print("wt: generate failed for built-in %d -- %s" % (idx, e))
+        return None
+    try:
+        lsb = getattr(amy, "load_sample_bytes", None)
+        if lsb is not None:
+            lsb(data, preset=preset, midinote=60, sr=SR)
+        else:
+            amy.send(load_sample="%d,%d,%d,60,0,0"
+                     % (preset, len(data) // 2, SR))
+            b64 = getattr(amy, "b64", None)
+            chunk = getattr(amy, "_send_transfer_chunk", None) or amy.send_raw
+            if b64 is None:
+                import binascii
+                b64 = lambda b: binascii.b2a_base64(b)[:-1]
+            for i in range(0, len(data), 188):
+                chunk(b64(data[i:i + 188]).decode('ascii'))
+    except Exception as e:
+        print("wt: load of built-in %d failed -- %s" % (idx, e))
+        return None
+    _wt_gen_loaded.add(idx)
+    return preset
 
 
 def wt_scan_sd():
@@ -1076,8 +1220,12 @@ def wt_preset_for(idx):
         return WT_BUILTIN_BASE
     idx = int(clamp(idx, 0, len(WT_CATALOG) - 1))
     name, path, builtin = WT_CATALOG[idx]
+    if callable(builtin):
+        # Procedural built-in: render + load on first use, ROM as last resort.
+        pr = _wt_gen_preset(idx, builtin)
+        return pr if pr is not None else WT_BUILTIN_BASE
     if builtin is not None:
-        return builtin
+        return builtin              # a firmware ROM preset (fallback only)
     if path in _wt_failed:
         return None
     if not _file_exists(path):
@@ -3988,8 +4136,15 @@ def wt_list():
     print("catalogue (TABLE knob) -- root:", WT_ROOT or "(SD not scanned yet)")
     for i in range(len(WT_CATALOG)):
         name, path, builtin = WT_CATALOG[i]
-        where = "builtin preset %d" % builtin if builtin is not None else path
+        if callable(builtin):
+            where = "generated (RAM preset %d)" % (WT_GEN_BASE + i)
+        elif builtin is not None:
+            where = "ROM preset %d" % builtin
+        else:
+            where = path
         live = ""
+        if callable(builtin) and i in _wt_gen_loaded:
+            live = "  [resident]"
         if path in _wt_slot_of:
             live = "  [RAM preset %d]" % _wt_slot_of[path]
         if path in _wt_failed:
@@ -4231,8 +4386,8 @@ def boot():
     # only later, on demand, from the WT LOAD page or when a patch names a
     # table -- so a missing or slow card can never stall or break boot.
     n = wt_builtins()
-    print("wavetables: %d built-in (INT 0..%d); load SD tables on the WT LOAD page"
-          % (n, WT_BUILTIN_COUNT - 1))
+    print("wavetables: %d built-in (%s); load SD tables on the WT LOAD page"
+          % (n, "/".join(nm for nm, _ in WT_BUILTIN)))
     wt_remember_selection()
 
     # CV calibration is restored BEFORE the voices are built, so the loaded

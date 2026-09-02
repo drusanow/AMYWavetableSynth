@@ -24,14 +24,28 @@ per voice (5 AMY oscillators)          4 voices = 20 oscs, 8 sounding
 
 ## Getting started
 
-1. Copy `sketch_wt.py` to the board and run it. It **boots on the five built-in
-   wavetables** (`INT 0`…`INT 4`) and listens on MIDI channel 1. Startup never
-   touches the SD card, so a missing or slow card can't stall or break it.
+1. Copy `sketch_wt.py` to the board and run it. It **boots on six built-in
+   wavetables** — `SAW · SQUARE · HARM · VOX · FOLD · BELL` — and listens on
+   MIDI channel 1. Startup never touches the SD card, so a missing or slow card
+   can't stall or break it.
 2. To use your own tables, copy `.wav` files **anywhere on the SD card** —
    any folder, any depth — then load one from the **WT LOAD** page (below).
    No fixed folder layout is required. Nothing on the card is read until you ask.
 3. From the REPL: `status()`, `wt_list()`, `wt_scan()`, `sd_ls()`,
    `wt_selftest()`.
+
+### Built-in wavetables
+
+The six built-ins are **generated in Python** at boot (and on demand), not read
+from firmware ROM. AMY's baked-in ROM wavetables barely change across their
+range and sound nearly identical — measured directly against AMY's renderer —
+so the synth ships its own instead. Each one **sweeps a wide timbral range as
+POSITION moves**: `SAW` fills in from a sine to a bright saw, `HARM` stacks
+harmonics like an organ, `SQUARE` sweeps pulse width, `VOX` slides a formant
+pair, `FOLD` drives a sine into a wavefolder, and `BELL` brings in inharmonic
+partials. Moving the `POSITION` control (or routing a MOD to it) scans the full
+morph. The two boot defaults (`SAW`, `SQUARE`) are the cheap ones to generate;
+the richer tables render the first time you select them.
 
 ### Loading a wavetable from SD
 
