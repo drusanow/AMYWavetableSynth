@@ -3231,6 +3231,39 @@ def _vtrace(d, pts, col, y_lo, y_hi):
         i += 1
 
 
+def _vtrace_dither(d, pts, col, y_lo, y_hi):
+    """Draw a polyline as a 50%% checkerboard of pixels.
+
+    On the 1-bit SH1107 (pixels are on or off) this is how you get a DIM grey:
+    lighting every other pixel in a fixed (x+y) parity reads as a uniform grey
+    wash to the eye, distinct from a solid (full-brightness) line -- exactly the
+    grey terrain / bright highlight look, with no thick line and no per-frame
+    flicker.  On a greyscale panel `col` (C_DIM) makes it grey natively; the
+    dither only makes it a touch dimmer, which is fine."""
+    i = 1
+    while i < len(pts):
+        x0, y0 = int(pts[i - 1][0]), int(clamp(pts[i - 1][1], y_lo, y_hi - 1))
+        x1, y1 = int(pts[i][0]), int(clamp(pts[i][1], y_lo, y_hi - 1))
+        dx = x1 - x0 if x1 >= x0 else x0 - x1
+        dy = -(y1 - y0) if y1 >= y0 else -(y0 - y1)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            if ((x0 + y0) & 1) == 0:            # 50%% dither -> perceived grey
+                d.pixel(x0, y0, col)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+        i += 1
+
+
 def draw_scope(d):
     """Live post-FX output waveform, read straight off AMY's last-rendered
     block (amy.get_output_buffer() -- src/api.c returns the exact bytes about
@@ -3315,11 +3348,13 @@ def draw_vis_wavetable(d, y0, h, which):
     """Topographic waterfall of the ACTUAL wavetable, Ableton-style.
 
     Every frame of the table is drawn as a stacked waveform line, receding with
-    a slight parallax skew; the frame at the current POSITION is highlighted
-    bright and thick (a black gap isolates it so it reads clearly even on the
-    1-bit panel, where grey and white are the same pixel).  The data is the
-    real table -- computed from the generator for a built-in, from the loaded
-    samples for an SD table -- so the picture and the sound never disagree."""
+    a slight parallax skew.  The terrain is drawn DIM -- a 50%% checkerboard
+    dither, which the 1-bit SH1107 shows as grey -- and the frame at the current
+    POSITION is drawn SOLID (full brightness), so the highlight reads by
+    brightness rather than by thickness.  On a greyscale panel the same
+    C_DIM/C_BRIGHT colours give the grey/white directly.  The data is the real
+    table -- from the generator for a built-in, from the loaded samples for an
+    SD table -- so the picture and the sound never disagree."""
     y_hi = y0 + h
     d.fill_rect(0, y0, SCREEN_W, h, 0)
     pos = clamp(P[which + "_pos"], 0.0, 1.0)
@@ -3357,21 +3392,22 @@ def draw_vis_wavetable(d, y0, h, which):
             pts.append((x, yy))
         return pts
 
-    # Back-to-front (topmost frame first) so nearer lines overdraw farther ones.
+    # DIM terrain (dithered grey), back-to-front so nearer lines overdraw
+    # farther ones.  A one-pixel black skirt just below the selected frame
+    # clears the dither immediately under it, so the solid highlight sits on a
+    # clean edge rather than blending into the checkerboard.
+    sel = frame_pts(cur)
     for li in range(n):
         if li == cur:
             continue
-        _vtrace(d, frame_pts(li), C_DIM, y0, y_hi)
-
-    # Isolate the selected frame with a one-pixel black gap above and below,
-    # then draw it bright and two pixels thick -- unmistakable on any panel.
-    sel = frame_pts(cur)
+        _vtrace_dither(d, frame_pts(li), C_DIM, y0, y_hi)
     for (x, yy) in sel:
-        for gy in (yy - 2, yy + 2):
-            if y0 <= gy < y_hi:
-                d.pixel(x, gy, 0)
+        if y0 <= yy + 1 < y_hi:
+            d.pixel(x, yy + 1, 0)
+
+    # BRIGHT highlight: a single solid line at full brightness -- distinct from
+    # the 50%% terrain by luminance, not by thickness.
     _vtrace(d, sel, C_BRIGHT, y0, y_hi)
-    _vtrace(d, [(x, yy + 1) for (x, yy) in sel], C_BRIGHT, y0, y_hi)
 
     # A small position readout, top-left, so the exact value is legible too.
     _vtext(d, "%d%%" % int(pos * 100 + 0.5), 1, y0, C_VIS, y0, y_hi)
