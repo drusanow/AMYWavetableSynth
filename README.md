@@ -44,7 +44,9 @@ POSITION moves**: `SAW` fills in from a sine to a bright saw, `HARM` stacks
 harmonics like an organ, `SQUARE` sweeps pulse width, `VOX` slides a formant
 pair, `FOLD` drives a sine into a wavefolder, and `BELL` brings in inharmonic
 partials. Moving the `POSITION` control (or routing a MOD to it) scans the full
-morph. The two boot defaults (`SAW`, `SQUARE`) are the cheap ones to generate;
+morph. The **OSC A / OSC B** pages draw the selected table as a
+topographic waterfall (Ableton-style): every frame stacked as a line, with the
+frame at the current POSITION highlighted bright and tracking the knob. The two boot defaults (`SAW`, `SQUARE`) are the cheap ones to generate;
 the richer tables render the first time you select them.
 
 ### Loading a wavetable from SD

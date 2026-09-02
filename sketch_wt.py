@@ -987,6 +987,31 @@ def wt_path(idx):
     return WT_CATALOG[int(clamp(idx, 0, len(WT_CATALOG) - 1))][1]
 
 
+def _wt_preview_for(idx):
+    """The downsampled cycle preview for catalogue entry `idx`, or None.
+
+    Built on demand from the generator (built-in) or from the samples captured
+    at load (SD), then cached by table id so the display costs nothing per
+    frame."""
+    if not WT_CATALOG:
+        return None
+    idx = int(clamp(idx, 0, len(WT_CATALOG) - 1))
+    name, path, builtin = WT_CATALOG[idx]
+    tid = ("gen", idx) if callable(builtin) else (path if path else ("rom", builtin))
+    pv = _wt_prev_cache.get(tid)
+    if pv is not None:
+        return pv
+    if callable(builtin):
+        pv = _preview_from_gen(builtin)
+    elif path is not None:
+        pv = _wt_sample_preview.get(path)
+    else:
+        pv = None                       # ROM fallback: no sample data in Python
+    if pv is not None:
+        _wt_prev_cache[tid] = pv
+    return pv
+
+
 def _sd_basename(rel):
     """Filename (no folders, no extension) from a browse-list relative path."""
     return rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
@@ -1152,6 +1177,57 @@ def _wav_to_mono16(path):
         f.close()
 
 
+# --------------------------------------------------------------------------
+#  WAVETABLE PREVIEW  --  data for the topographic (waterfall) display
+# --------------------------------------------------------------------------
+#  A tiny downsampled copy of each table's cycles: WT_PREV_LINES frames, each
+#  WT_PREV_PTS points in -1..1.  Cheap to hold (a few hundred floats per table)
+#  and to draw.  Built from the generator for a built-in, and from the decoded
+#  samples for an SD table (captured once at load).  Keyed by table id so the
+#  OSC A/B pane can look it up without recomputing on every redraw.
+WT_PREV_LINES = 16
+WT_PREV_PTS = 44
+_wt_prev_cache = {}          # table-id -> list[WT_PREV_LINES] of list[WT_PREV_PTS]
+_wt_sample_preview = {}      # SD path -> preview (captured at load time)
+
+
+def _norm_row(row):
+    pk = 1e-9
+    for v in row:
+        a = v if v >= 0 else -v
+        if a > pk:
+            pk = a
+    g = 1.0 / pk
+    return [v * g for v in row]
+
+
+def _preview_from_gen(fn):
+    lines = []
+    for c in range(WT_PREV_LINES):
+        m = c / float(WT_PREV_LINES - 1)
+        row = [fn(i / float(WT_PREV_PTS), m) for i in range(WT_PREV_PTS)]
+        lines.append(_norm_row(row))
+    return lines
+
+
+def _preview_from_samples(mono):
+    """Downsample decoded 16-bit LE mono bytes into the preview grid."""
+    total = len(mono) // 2
+    ncyc = total // WT_CYCLE
+    if ncyc < 2:
+        return None
+    lines = []
+    for li in range(WT_PREV_LINES):
+        c = int(li * (ncyc - 1) / float(WT_PREV_LINES - 1))
+        base = c * WT_CYCLE
+        row = []
+        for i in range(WT_PREV_PTS):
+            si = base + int(i * (WT_CYCLE - 1) / float(WT_PREV_PTS - 1))
+            row.append(struct.unpack_from('<h', mono, si * 2)[0] / 32768.0)
+        lines.append(_norm_row(row))
+    return lines
+
+
 def _wt_stream_file(path, slot):
     """Decode `path` and stream it into AMY preset `slot` as a wavetable.
 
@@ -1160,6 +1236,13 @@ def _wt_stream_file(path, slot):
     mono, sr, nframes = _wav_to_mono16(path)
     if nframes < WT_MIN_SAMPLES:
         raise ValueError("too short (<512 smp)")
+    # Capture a preview for the topographic display while we have the samples.
+    try:
+        pv = _preview_from_samples(mono)
+        if pv is not None:
+            _wt_sample_preview[path] = pv
+    except Exception:
+        pass
     # load_sample_bytes is the public path that handles the wire/transfer
     # chunking; fall back to the raw header+chunk protocol if a stripped build
     # doesn't expose it.
@@ -1276,6 +1359,8 @@ def wt_rescan():
     catalogue and the oscillator points at it again.  Does not disturb what is
     already loaded in RAM."""
     _wt_failed.clear()
+    _wt_prev_cache.clear()          # a card swap may replace a same-named file
+    _wt_sample_preview.clear()
     n = wt_scan_sd()
     for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
         if path is not None and wt_index_of_path(path) < 0 and _file_exists(path):
@@ -3227,44 +3312,69 @@ def draw_adsr(d, a_ms, d_ms, s_lvl, r_ms):
 
 
 def draw_vis_wavetable(d, y0, h, which):
-    """The wavetable as a stack of cycles, with the scan position marked.
+    """Topographic waterfall of the ACTUAL wavetable, Ableton-style.
 
-    Eight slices stand in for the 64 cycles of a table; the bright one is where
-    POSITION currently sits, and the bracket around it shows how far the live
-    modulation swings it.  That swing is read from the same matrix the audio
-    uses, so the picture cannot drift out of step with the sound."""
+    Every frame of the table is drawn as a stacked waveform line, receding with
+    a slight parallax skew; the frame at the current POSITION is highlighted
+    bright and thick (a black gap isolates it so it reads clearly even on the
+    1-bit panel, where grey and white are the same pixel).  The data is the
+    real table -- computed from the generator for a built-in, from the loaded
+    samples for an SD table -- so the picture and the sound never disagree."""
     y_hi = y0 + h
     d.fill_rect(0, y0, SCREEN_W, h, 0)
     pos = clamp(P[which + "_pos"], 0.0, 1.0)
-    # Total modulation reach on this destination, in position units.
-    swing = 0.0
-    for slot in range(NMOD):
-        amt = mx_get(slot, which + "_pos")
-        if amt:
-            off, coef = mod_terms(slot, amt, 'lin')
-            swing += abs(coef)
-    nsl = 8
-    slot_w = SCREEN_W // nsl
-    cur = int(clamp(pos * (nsl - 1) + 0.5, 0, nsl - 1))
-    for i in range(nsl):
-        # Each slice is a little waveform whose shape walks from a soft sine at
-        # the bottom of the table to a jagged one at the top -- a stand-in for
-        # "the table changes as you scan", not a render of the real file.
-        amp = (h // 2 - 3)
-        col = C_BRIGHT if i == cur else C_DIM
+    lines = _wt_preview_for(int(P[which + "_wt"]))
+    if not lines:
+        # ROM fallback (no sample data in Python): just a position bar.
+        _vtext(d, "POS %d%%" % int(pos * 100), 2, y0 + 1, C_DIM, y0, y_hi)
+        _vrect(d, 2, y_hi - 4, int((SCREEN_W - 4) * pos), 2, C_BRIGHT, y0, y_hi)
+        return
+
+    n = len(lines)
+    npts = len(lines[0])
+    cur = int(pos * (n - 1) + 0.5)
+    if cur < 0:
+        cur = 0
+    elif cur > n - 1:
+        cur = n - 1
+    # Geometry tuned to whatever band height this page has (OSC A/B leave ~32px).
+    skew = 10 if h >= 20 else 4                 # total horizontal parallax
+    dx = skew / float(n)
+    top = y0 + 1
+    avail = h - 2
+    spacing = avail / float(n)                  # vertical step between frames
+    amp = spacing * 1.7                          # waveforms overlap -> "terrain"
+    xspan = SCREEN_W - skew - 2
+
+    def frame_pts(li):
+        yb = top + int(li * spacing) + int(amp * 0.5)
+        xo = 1 + int((n - 1 - li) * dx)          # top frames pushed right
         pts = []
-        for xx in range(0, slot_w - 2, 2):
-            ph = xx / float(max(1, slot_w - 2))
-            harm = 1.0 + i * 0.9
-            v = math.sin(2 * math.pi * ph) + (math.sin(2 * math.pi * harm * ph)
-                                              * (i / float(nsl)) * 0.8)
-            pts.append((i * slot_w + 1 + xx, y0 + h // 2 - v * amp * 0.5))
-        _vtrace(d, pts, col, y0, y_hi)
-    if swing > 0.0:
-        lo = int(clamp((pos - swing) * SCREEN_W, 0, SCREEN_W - 1))
-        hi = int(clamp((pos + swing) * SCREEN_W, 0, SCREEN_W - 1))
-        _vrect(d, lo, y_hi - 3, max(1, hi - lo), 2, C_VIS, y0, y_hi)
-    _vrect(d, int(pos * (SCREEN_W - 3)), y_hi - 5, 3, 4, C_BRIGHT, y0, y_hi)
+        row = lines[li]
+        for i in range(npts):
+            x = xo + int(i * (xspan - 1) / float(npts - 1))
+            yy = yb - int(row[i] * amp * 0.5)
+            pts.append((x, yy))
+        return pts
+
+    # Back-to-front (topmost frame first) so nearer lines overdraw farther ones.
+    for li in range(n):
+        if li == cur:
+            continue
+        _vtrace(d, frame_pts(li), C_DIM, y0, y_hi)
+
+    # Isolate the selected frame with a one-pixel black gap above and below,
+    # then draw it bright and two pixels thick -- unmistakable on any panel.
+    sel = frame_pts(cur)
+    for (x, yy) in sel:
+        for gy in (yy - 2, yy + 2):
+            if y0 <= gy < y_hi:
+                d.pixel(x, gy, 0)
+    _vtrace(d, sel, C_BRIGHT, y0, y_hi)
+    _vtrace(d, [(x, yy + 1) for (x, yy) in sel], C_BRIGHT, y0, y_hi)
+
+    # A small position readout, top-left, so the exact value is legible too.
+    _vtext(d, "%d%%" % int(pos * 100 + 0.5), 1, y0, C_VIS, y0, y_hi)
 
 
 def draw_vis_filter(d, y0, h):
