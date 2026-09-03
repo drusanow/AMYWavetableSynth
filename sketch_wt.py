@@ -2122,15 +2122,24 @@ def load_cv_cal():
     return True
 
 
+_cal_last_save = 0
+
+
 def apply_cvcal():
     """CV CAL page handler.
 
     Every control is a plain live setting -- turn it, hear it.  The values read
     out of P into the module constants the CV engine uses, then push to AMY
-    immediately.  Persistence is deferred to page-change (flash writes are slow
-    and these are knobs you sweep)."""
+    immediately.
+
+    CV calibration is a GLOBAL, PERSISTENT setting: it describes this rig, not a
+    sound, so it is never stored in a patch (see PATCH_SKIP) and it lives in its
+    own file (CV_CAL_FILE).  To make sure it survives even if the app is closed
+    right after a tweak, a change is written to flash promptly here (throttled
+    so a knob sweep does not hammer the card), with a final flush on page
+    change (cv_cal_save_if_dirty)."""
     global CV_PITCH_OFFSET_V, CV_PITCH_COARSE_V, CV_GATE_ON, CV_GATE_OFF
-    global CV_BASE_NOTE, _cal_dirty, _cv_cal_msg
+    global CV_BASE_NOTE, _cal_dirty, _cv_cal_msg, _cal_last_save
     changed = False
     if CV_PITCH_OFFSET_V != P["cvoff"]:
         CV_PITCH_OFFSET_V = P["cvoff"]
@@ -2149,10 +2158,16 @@ def apply_cvcal():
         _cv_cal_msg = "trim %+.2fV" % cv_offset_volts()
         push_cv_pitch()
         _cal_dirty = True
+        now = _now()
+        if _dt(now, _cal_last_save) > 1000:      # at most ~1 write/second
+            if save_cv_cal():
+                _cal_dirty = False
+            _cal_last_save = now
 
 
 def cv_cal_save_if_dirty():
-    """Flush a changed calibration to flash.  Called on page change."""
+    """Flush a changed calibration to flash.  Called on page change, so the last
+    value of a sweep is always persisted even if the throttle skipped it."""
     global _cal_dirty
     if _cal_dirty:
         save_cv_cal()
@@ -2512,40 +2527,42 @@ PAGES = [
 
 # 4-character grid labels, keyed by parameter so a control that appears on two
 # screens reads the same on both.
+# Three-letter cell labels.  The focused parameter's FULL name and value are
+# shown at the top of the page, so the cells only need a compact reminder.
 SHORT = {
-    "a_wt": "TAB", "a_pos": "POS", "a_coarse": "CRS", "a_fine": "FINE",
-    "a_lvl": "LVL", "a_drv": "DRIV", "a_fold": "FOLD", "a_phase": "PHAS",
-    "b_wt": "TAB", "b_pos": "POS", "b_coarse": "CRS", "b_fine": "FINE",
-    "b_lvl": "LVL", "b_drv": "DRIV", "b_fold": "FOLD", "b_phase": "PHAS",
-    "vmode": "VOIC", "glide": "GLID", "vsens": "VSNS", "phsync": "SYNC",
-    "bend": "BEND", "mch": "MIDI", "vol": "VOL", "panic": "PNIC",
-    "wt_src": "DEST", "wt_browse": "FILE", "wt_load": "LOAD", "wt_scan_act": "SCAN",
-    "ftype": "TYPE", "cutoff": "CUT", "reso": "RESO", "fenv": "ENV",
-    "fkbd": "KBD", "fvel": "VEL", "fdrv": "DRIV", "fmix": "MIX",
-    "aa": "A.A", "ad": "A.D", "as": "A.S", "ar": "A.R", "acurve": "CRV",
-    "m1_shape": "SHAP", "m1_mode": "MODE", "m1_rate": "RATE",
-    "m1_ratio": "RTIO", "m1_depth": "DEPT", "m1_phase": "PHAS",
-    "m1_div": "SYNC", "m1_pol": "POL", "m1_trig": "TRIG",
-    "m2_shape": "SHAP", "m2_mode": "MODE", "m2_rate": "RATE",
-    "m2_ratio": "RTIO", "m2_depth": "DEPT", "m2_phase": "PHAS",
-    "m2_div": "SYNC", "m2_pol": "POL", "m2_trig": "TRIG",
-    "m3_a": "A", "m3_d": "D", "m3_s": "S", "m3_r": "R",
+    "a_wt": "TAB", "a_pos": "POS", "a_coarse": "CRS", "a_fine": "FIN",
+    "a_lvl": "LVL", "a_drv": "DRV", "a_fold": "FLD", "a_phase": "PHS",
+    "b_wt": "TAB", "b_pos": "POS", "b_coarse": "CRS", "b_fine": "FIN",
+    "b_lvl": "LVL", "b_drv": "DRV", "b_fold": "FLD", "b_phase": "PHS",
+    "vmode": "VOI", "glide": "GLD", "vsens": "VEL", "phsync": "SYN",
+    "bend": "BND", "mch": "MID", "vol": "VOL", "panic": "PNC",
+    "wt_src": "DST", "wt_browse": "FIL", "wt_load": "LD", "wt_scan_act": "SCN",
+    "ftype": "TYP", "cutoff": "CUT", "reso": "RES", "fenv": "ENV",
+    "fkbd": "KBD", "fvel": "VEL", "fdrv": "DRV", "fmix": "MIX",
+    "aa": "ATK", "ad": "DEC", "as": "SUS", "ar": "REL", "acurve": "CRV",
+    "m1_shape": "SHP", "m1_mode": "MOD", "m1_rate": "RAT",
+    "m1_ratio": "RTO", "m1_depth": "DEP", "m1_phase": "PHS",
+    "m1_div": "SYN", "m1_pol": "POL", "m1_trig": "TRG",
+    "m2_shape": "SHP", "m2_mode": "MOD", "m2_rate": "RAT",
+    "m2_ratio": "RTO", "m2_depth": "DEP", "m2_phase": "PHS",
+    "m2_div": "SYN", "m2_pol": "POL", "m2_trig": "TRG",
+    "m3_a": "ATK", "m3_d": "DEC", "m3_s": "SUS", "m3_r": "REL",
     "m3_curve": "CRV", "m3_vel": "VEL", "m3_pol": "POL",
-    "m4_a": "A", "m4_d": "D", "m4_s": "S", "m4_r": "R",
+    "m4_a": "ATK", "m4_d": "DEC", "m4_s": "SUS", "m4_r": "REL",
     "m4_curve": "CRV", "m4_vel": "VEL", "m4_pol": "POL",
-    "mx_slot": "SLOT", "mx_dest": "DEST", "mx_amt": "AMT",
-    "mx_clr": "CLR", "mx_clrall": "CLRA",
-    "uni_det": "DTUN", "uni_width": "WIDE", "uni_pos": "P.SPR",
-    "uni_phase": "PH.S", "uni_drift": "DRFT",
-    "d_drive": "DRIV", "d_clip": "CLIP", "d_fold": "FOLD",
-    "d_bits": "BITS", "d_rate": "RATE", "d_mix": "MIX",
-    "ch_lvl": "CHOR", "ch_dly": "C.DLY", "ch_rate": "C.RT",
-    "ch_dep": "C.DP", "ec_lvl": "ECHO", "ec_ms": "E.MS",
-    "ec_fb": "E.FB", "ec_tone": "E.TN",
-    "rv_lvl": "REVB", "rv_live": "LIVE", "rv_damp": "DAMP",
-    "rv_xover": "XOVR", "eq_l": "EQ.L", "eq_m": "EQ.M", "eq_h": "EQ.H",
+    "mx_slot": "SLT", "mx_dest": "DST", "mx_amt": "AMT",
+    "mx_clr": "CLR", "mx_clrall": "CLA",
+    "uni_det": "DTN", "uni_width": "WID", "uni_pos": "PSP",
+    "uni_phase": "PHS", "uni_drift": "DRF",
+    "d_drive": "DRV", "d_clip": "CLP", "d_fold": "FLD",
+    "d_bits": "BIT", "d_rate": "RAT", "d_mix": "MIX",
+    "ch_lvl": "CHO", "ch_dly": "CDL", "ch_rate": "CRT",
+    "ch_dep": "CDP", "ec_lvl": "ECH", "ec_ms": "EMS",
+    "ec_fb": "EFB", "ec_tone": "ETN",
+    "rv_lvl": "RVB", "rv_live": "LIV", "rv_damp": "DMP",
+    "rv_xover": "XOV", "eq_l": "EQL", "eq_m": "EQM", "eq_h": "EQH",
     "tempo": "BPM",
-    "cvatt": "ATTN", "cvoff": "OFFS", "cvgate": "GATE", "cvnote": "0V.N",
+    "cvatt": "ATN", "cvoff": "OFF", "cvgate": "GAT", "cvnote": "0VN",
 }
 
 
@@ -2603,35 +2620,6 @@ def fmt_value(key, kind, v):
     return "%.2f" % v
 
 
-def cell_value(key, kind, v):
-    """Compact 4-character value for a grid cell (the header shows it in full)."""
-    if kind == 'a':
-        return "GO"
-    if kind == 'wt':
-        return wt_name(v)[:4]
-    if kind == 'sd':
-        return _sd_name(v)[:4]
-    if kind == 'e':
-        lst = ENUM_LISTS.get(key)
-        if lst:
-            return lst[int(clamp(int(v), 0, len(lst) - 1))][:4]
-        return "%d" % int(v)
-    if kind in ('i', 'ct'):
-        return "%d" % int(v)
-    if kind == 'ms':
-        if v >= 1000:
-            return "%.1fs" % (v / 1000.0)
-        return "%d" % int(v)
-    if kind == 'hz':
-        if v >= 1000:
-            return "%.1fk" % (v / 1000.0)
-        return "%d" % int(v)
-    a = v if v >= 0 else -v
-    if a >= 10.0:
-        return "%d" % int(round(v))
-    if v < 0:
-        return "%.1f" % v
-    return "%.2f" % v
 
 
 def row_hi(row):
@@ -2980,7 +2968,10 @@ STATUS_Y   = 107
 DOTS_Y     = 118
 GRID_COLS  = 4
 CELL_W     = SCREEN_W // GRID_COLS
-CELL_H     = 29
+# Dropping the per-cell value line lets a cell be just label + bar, freeing
+# vertical space: shorter cells push the grid down and give every visual pane
+# (waterfall, scope, curves) a taller band -- a cleaner, less cramped layout.
+CELL_H     = 22
 BAR_W      = 26
 BAR_H      = 6
 TOAST_MS   = 1400
@@ -3148,8 +3139,12 @@ def draw_dots(d, y, cur, total):
         x += w + gap
 
 
-def draw_cell(d, x0, y0, label, val, n01, bip, state):
-    """state: 0 = idle, 1 = cursor, 2 = selected (being edited)."""
+def draw_cell(d, x0, y0, label, n01, bip, state):
+    """One grid cell: a 3-letter label and its bar -- no number.
+
+    The live value is shown in full at the top of the page for the focused
+    parameter, so repeating it in every cell was just clutter.  state: 0 = idle,
+    1 = cursor, 2 = selected (being edited)."""
     cx = x0 + CELL_W // 2
     if state == 2:
         d.fill_rect(x0, y0, CELL_W, CELL_H - 2, C_BRIGHT)
@@ -3160,11 +3155,9 @@ def draw_cell(d, x0, y0, label, val, n01, bip, state):
             fg = bout = bfill = tick = C_BRIGHT
             d.fill_rect(x0, y0 + CELL_H - 2, CELL_W, 1, C_BRIGHT)
     lx = cx - (len(label) * CHAR_W) // 2
-    d.text(label, max(x0, lx), y0 + 2, fg)
-    vx = cx - (len(val) * CHAR_W) // 2
-    d.text(val, max(x0, vx), y0 + 11, fg)
+    d.text(label, max(x0, lx), y0 + 3, fg)
     bx = cx - BAR_W // 2
-    by = y0 + 20
+    by = y0 + 13
     d.fill_rect(bx, by, BAR_W, 1, bout)
     d.fill_rect(bx, by + BAR_H - 1, BAR_W, 1, bout)
     d.fill_rect(bx, by, 1, BAR_H, bout)
@@ -3361,7 +3354,6 @@ def draw_vis_wavetable(d, y0, h, which):
     lines = _wt_preview_for(int(P[which + "_wt"]))
     if not lines:
         # ROM fallback (no sample data in Python): just a position bar.
-        _vtext(d, "POS %d%%" % int(pos * 100), 2, y0 + 1, C_DIM, y0, y_hi)
         _vrect(d, 2, y_hi - 4, int((SCREEN_W - 4) * pos), 2, C_BRIGHT, y0, y_hi)
         return
 
@@ -3406,11 +3398,10 @@ def draw_vis_wavetable(d, y0, h, which):
             d.pixel(x, yy + 1, 0)
 
     # BRIGHT highlight: a single solid line at full brightness -- distinct from
-    # the 50%% terrain by luminance, not by thickness.
+    # the 50%% terrain by luminance, not by thickness.  No numeric readout: the
+    # waterfall already shows where POSITION sits, and its value is on the
+    # header when the row is focused.
     _vtrace(d, sel, C_BRIGHT, y0, y_hi)
-
-    # A small position readout, top-left, so the exact value is legible too.
-    _vtext(d, "%d%%" % int(pos * 100 + 0.5), 1, y0, C_VIS, y0, y_hi)
 
 
 def draw_vis_filter(d, y0, h):
@@ -3800,8 +3791,7 @@ def draw_grid(d):
         x0, y0 = cell_xy(i, len(rows))
         n01, bip = cell_norm(rows[i])
         state = 2 if (i == cursor and editing) else (1 if i == cursor else 0)
-        draw_cell(d, x0, y0, SHORT.get(key, label[:4]),
-                  cell_value(key, kind, P[key]), n01, bip, state)
+        draw_cell(d, x0, y0, SHORT.get(key, label[:3]), n01, bip, state)
     draw_dots(d, DOTS_Y, page, N_PAGES)
 
 

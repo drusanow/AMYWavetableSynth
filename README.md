@@ -173,7 +173,10 @@ by envelopes and LFOs at zero MicroPython cost.
 `OSC A · OSC B · WT LOAD · MIX · FILTER · ENV · MOD 1 · MOD 2 · MOD 3 · MOD 4 ·
 MATRIX · UNISON · DRIVE · FX · REVERB · CV CAL · PATCH`
 
-Turn to move, click to edit, **hold to pick a screen**. On an 8-encoder board
+Each cell shows a **3-letter label and its bar** — no number. The focused
+parameter's full name and value are shown at the top of the page, so the cells
+stay uncluttered and the visual pane gets more room. Turn to move, click to
+edit, **hold to pick a screen**. On an 8-encoder board
 each encoder edits its own row directly. Every page carries a picture of what
 its settings are doing — the output oscilloscope on MIX, the filter response
 curve, ADSR shapes, LFO waveforms, the live matrix grid, the unison spread and
