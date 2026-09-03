@@ -113,16 +113,30 @@ different AMY snapshots, so one build may not know a keyword another does. All
 `amy.send`s go through a resilient wrapper: a keyword this build doesn't
 recognise is dropped (reported once) instead of taking the whole message —
 and its oscillator — down with it. The newest feature the synth uses is the
-per-oscillator/bus **distortion** block (`dist_*`); it's probed once at boot,
-and if it's absent the `DRIVE`/`FOLD` controls simply do nothing. Boot prints a
-line telling you which build you're on, e.g.:
+per-oscillator/bus **distortion** block (`dist_*`); it's probed once at boot.
+When it's present, `DRIVE`/`FOLD` run natively in the engine — instant and
+modulatable. When it's **absent** (several web/desktop builds ship without
+`dist_*`), the synth doesn't just fall silent: it **bakes** the drive and
+wavefold transfer curve straight into the wavetable samples in Python — cubic
+soft-clip for drive, triangle folding for fold — so the controls keep working
+regardless of firmware. Baking re-renders the affected oscillator's table
+(synchronously on the first turn of a knob, then debounced), so it's a touch
+less nimble than native `dist_*` but sounds the same. Boot prints which path
+you're on, e.g.:
 
 ```
-AMY 1.2.162 -- distortion FX available
+AMY 1.2.162 -- distortion: native (dist_*)
 ```
 
-(An older build prints `distortion FX NOT in this build (DRIVE/FOLD off)` — the
-synth is otherwise fully functional.)
+or, on a build without the block:
+
+```
+AMY 1.2.x -- distortion: no dist_* in this build -> DRIVE/FOLD baked into the tables
+```
+
+Call `dist_status()` at the REPL any time to see which path is active. To get
+instant, fully-modulatable distortion back, update to an AMY build that
+includes `dist_*`.
 
 ## Voice modes
 

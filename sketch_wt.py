@@ -987,6 +987,15 @@ def wt_path(idx):
     return WT_CATALOG[int(clamp(idx, 0, len(WT_CATALOG) - 1))][1]
 
 
+def _wt_table_id(idx):
+    """A stable id for catalogue entry `idx` -- ("gen", idx) for a built-in, the
+    path for an SD table, ("rom", n) for a ROM fallback.  Used to key the
+    preview and drive-bake caches."""
+    idx = int(clamp(idx, 0, len(WT_CATALOG) - 1))
+    name, path, builtin = WT_CATALOG[idx]
+    return ("gen", idx) if callable(builtin) else (path if path else ("rom", builtin))
+
+
 def _wt_preview_for(idx):
     """The downsampled cycle preview for catalogue entry `idx`, or None.
 
@@ -997,7 +1006,7 @@ def _wt_preview_for(idx):
         return None
     idx = int(clamp(idx, 0, len(WT_CATALOG) - 1))
     name, path, builtin = WT_CATALOG[idx]
-    tid = ("gen", idx) if callable(builtin) else (path if path else ("rom", builtin))
+    tid = _wt_table_id(idx)
     pv = _wt_prev_cache.get(tid)
     if pv is not None:
         return pv
@@ -1189,6 +1198,7 @@ WT_PREV_LINES = 16
 WT_PREV_PTS = 44
 _wt_prev_cache = {}          # table-id -> list[WT_PREV_LINES] of list[WT_PREV_PTS]
 _wt_sample_preview = {}      # SD path -> preview (captured at load time)
+_wt_base_mono = {}           # SD path -> full decoded 16-bit mono (for drive-bake)
 
 
 def _norm_row(row):
@@ -1236,11 +1246,14 @@ def _wt_stream_file(path, slot):
     mono, sr, nframes = _wav_to_mono16(path)
     if nframes < WT_MIN_SAMPLES:
         raise ValueError("too short (<512 smp)")
-    # Capture a preview for the topographic display while we have the samples.
+    # Capture a preview for the topographic display, and keep the decoded
+    # samples so the drive-bake fallback (see _osc_bake_preset) can process
+    # this table without re-reading the card.
     try:
         pv = _preview_from_samples(mono)
         if pv is not None:
             _wt_sample_preview[path] = pv
+        _wt_base_mono[path] = mono
     except Exception:
         pass
     # load_sample_bytes is the public path that handles the wire/transfer
@@ -1361,6 +1374,9 @@ def wt_rescan():
     _wt_failed.clear()
     _wt_prev_cache.clear()          # a card swap may replace a same-named file
     _wt_sample_preview.clear()
+    _wt_base_mono.clear()
+    _bake_base["a"] = _bake_base["b"] = None
+    _bake_loaded["a"] = _bake_loaded["b"] = None
     n = wt_scan_sd()
     for path, key in ((_a_wt_path, "a_wt"), (_b_wt_path, "b_wt")):
         if path is not None and wt_index_of_path(path) < 0 and _file_exists(path):
@@ -1570,6 +1586,17 @@ def osc_amp_coefs(which):
     return coef_str(c)
 
 
+def _eff_osc_drive(which):
+    """Effective per-osc drive.  Folding only bites once the signal exceeds
+    +/-1, but an oscillator sits below that (amp ~0.8), so with FOLD on we lift
+    drive to a minimum that actually reaches the fold threshold -- otherwise
+    turning FOLD on with drive at 1 does nothing audible."""
+    d = P[which + "_drv"]
+    if P[which + "_fold"] and d < 2.0:
+        d = 2.0
+    return d
+
+
 def osc_drive_coefs(which):
     """dist_drive for OSC A or B: the per-oscillator drive / wavefold depth.
 
@@ -1577,7 +1604,7 @@ def osc_drive_coefs(which):
     OCTAVES of it.  dist_drive is shared by whichever stages are enabled, so
     this is both the saturator's drive and the wavefolder's fold depth."""
     c = [None] * NCOEF
-    const = _apply_routings(c, which + "_drv", P[which + "_drv"], 'oct')
+    const = _apply_routings(c, which + "_drv", _eff_osc_drive(which), 'oct')
     c[C_CONST] = clamp(const, 0.0625, 16.0)
     return coef_str(c)
 
@@ -1738,6 +1765,183 @@ def mod_amp_coefs(n):
 
 
 # --------------------------------------------------------------------------
+#  DRIVE / WAVEFOLD  --  baked fallback for AMY builds without dist_*
+# --------------------------------------------------------------------------
+#  When this AMY build has the native distortion block (HAVE_DIST), DRIVE/FOLD
+#  are AMY dist_* commands: instant and per-note modulatable (the MATRIX A.DRV/
+#  B.DRV/F.DRV routings feed them).  Some builds -- the web REPL among them --
+#  don't have dist_* at all, so those commands are silently skipped and the
+#  knobs do nothing.  To make DRIVE/FOLD (and the bus DRIVE page) work anyway,
+#  we WAVESHAPE the wavetable samples in Python and load the processed table
+#  into a private preset the oscillator plays instead.  It is a per-cycle
+#  saturation/fold, which for a wavetable is a musically valid drive; the
+#  tradeoffs vs native dist are that it can't be modulated per note and a knob
+#  change takes a moment to re-bake (debounced).
+WT_PROC_BASE = 372          # baked drive/fold presets: OSC A -> 372, OSC B -> 373
+BAKE_SETTLE_MS = 250
+_bake_base = {"a": None, "b": None}      # (table_id, mono) source for each osc
+_bake_loaded = {"a": None, "b": None}    # signature currently in the processed preset
+_bake_pending = {"a": None, "b": None}   # (signature, request_time) awaiting settle
+
+
+def _bake_role(which):
+    return 0 if which == "a" else 1
+
+
+def _bake_active(which):
+    """The distortion the baked path must apply, or None if nothing is active.
+
+    Combines this oscillator's own DRIVE/FOLD with the bus DRIVE page (which,
+    without native dist, has nowhere else to act) so both surfaces work."""
+    if HAVE_DIST:
+        return None                      # native dist handles it instantly
+    drv = _eff_osc_drive(which)
+    fld = 1 if P[which + "_fold"] else 0
+    bd = P["d_drive"]
+    bf = 1 if P["d_fold"] else 0
+    bits = int(P["d_bits"])
+    rate = int(P["d_rate"])
+    osc_on = drv > 1.001 or fld
+    bus_on = bd > 1.001 or bf or bits < 16 or rate > 1
+    if not (osc_on or bus_on):
+        return None
+    idx = int(P[which + "_wt"])
+    return (idx, round(drv, 3), fld, round(bd, 3), bf, bits, rate)
+
+
+def _bake_base_mono(which):
+    idx = int(P[which + "_wt"])
+    tid = _wt_table_id(idx)
+    cur = _bake_base[which]
+    if cur and cur[0] == tid:
+        return cur[1]
+    name, path, builtin = WT_CATALOG[idx]
+    if callable(builtin):
+        mono = _wt_build_gen(builtin)
+    elif path is not None:
+        mono = _wt_base_mono.get(path)
+    else:
+        mono = None                      # ROM fallback: no samples in Python
+    _bake_base[which] = (tid, mono)
+    return mono
+
+
+def _bake_process(mono, sig):
+    """Waveshape 16-bit mono `mono` per the signature: gain -> fold -> soft
+    clip -> bitcrush -> decimate.  Returns processed 16-bit mono bytes."""
+    idx, drv, fld, bd, bf, bits, rate = sig
+    gain = drv * (bd if bd > 0.0 else 1.0)
+    fold = fld or bf
+    shift = 16 - bits if bits < 16 else 0
+    n = len(mono) // 2
+    out = bytearray(len(mono))
+    hold = 0
+    cnt = 0
+    for i in range(n):
+        x = struct.unpack_from('<h', mono, i * 2)[0] / 32768.0 * gain
+        if fold:
+            g = 0
+            while g < 4:
+                if x > 1.0:
+                    x = 2.0 - x
+                elif x < -1.0:
+                    x = -2.0 - x
+                g += 1
+        if x > 1.0:
+            x = 1.0
+        elif x < -1.0:
+            x = -1.0
+        else:
+            x = 1.5 * (x - x * x * x / 3.0)      # cubic soft clip (=+/-1 at +/-1)
+        v = int(x * 32767.0)
+        if shift:
+            v = (v >> shift) << shift
+        if rate > 1:
+            if cnt <= 0:
+                hold = v
+                cnt = rate
+            cnt -= 1
+            v = hold
+        if v > 32767:
+            v = 32767
+        elif v < -32768:
+            v = -32768
+        out[i * 2] = v & 0xFF
+        out[i * 2 + 1] = (v >> 8) & 0xFF
+    return bytes(out)
+
+
+def _bake_now(which, sig):
+    """Render + load the processed table for `which`.  Returns True on success."""
+    base = _bake_base_mono(which)
+    if base is None:
+        return False
+    try:
+        data = _bake_process(base, sig)
+    except Exception as e:
+        print("bake: process failed:", e)
+        return False
+    preset = WT_PROC_BASE + _bake_role(which)
+    try:
+        lsb = getattr(amy, "load_sample_bytes", None)
+        if lsb is not None:
+            lsb(data, preset=preset, midinote=60, sr=SR)
+        else:
+            amy.send(load_sample="%d,%d,%d,60,0,0" % (preset, len(data) // 2, SR))
+            b64 = getattr(amy, "b64", None)
+            chunk = getattr(amy, "_send_transfer_chunk", None) or amy.send_raw
+            if b64 is None:
+                import binascii
+                b64 = lambda b: binascii.b2a_base64(b)[:-1]
+            for i in range(0, len(data), 188):
+                chunk(b64(data[i:i + 188]).decode('ascii'))
+    except Exception as e:
+        print("bake: load failed:", e)
+        return False
+    _bake_loaded[which] = sig
+    return True
+
+
+def _osc_bake_preset(which):
+    """The preset OSC `which` should play under the baked fallback, or None to
+    use the plain (undistorted) table.
+
+    The first bake for a signature happens synchronously so audio is never
+    empty; later refinements (a knob still being turned) are debounced through
+    service_bake() to keep the knob responsive."""
+    sig = _bake_active(which)
+    if sig is None:
+        _bake_pending[which] = None
+        return None
+    preset = WT_PROC_BASE + _bake_role(which)
+    if _bake_loaded[which] == sig:
+        return preset
+    # A different table, or nothing baked yet -> bake now so audio is valid.
+    tid = _wt_table_id(int(P[which + "_wt"]))
+    base_tid = _bake_base[which][0] if _bake_base[which] else None
+    if _bake_loaded[which] is None or base_tid != tid:
+        if _bake_now(which, sig):
+            _bake_pending[which] = None
+            return preset
+        return None                      # can't bake (e.g. ROM) -> plain table
+    # Something valid is already loaded; defer this refinement.
+    _bake_pending[which] = (sig, _now())
+    return preset
+
+
+def service_bake():
+    """Apply any settled drive/fold re-bake.  Called from loop(); a no-op when
+    native distortion is available."""
+    if HAVE_DIST:
+        return
+    for which in ("a", "b"):
+        pend = _bake_pending[which]
+        if pend and _dt(_now(), pend[1]) > BAKE_SETTLE_MS:
+            _bake_pending[which] = None
+            _bake_now(which, pend[0])
+
+
+# --------------------------------------------------------------------------
 #  SECTION 6 : VOICE CONSTRUCTION
 # --------------------------------------------------------------------------
 _drift_cents = [0.0] * NVOICE       # slow analogue wander, written by service_drift()
@@ -1765,7 +1969,11 @@ def _send_osc_wt(sy, v, which, osc, chain_to, full):
     kw = {"synth": sy, "osc": osc}
     if WT_ENABLED:
         kw["wave"] = W_WAVETABLE
-        kw["preset"] = wt_preset_or_fallback(idx)
+        # When native distortion is missing, DRIVE/FOLD are baked into a
+        # processed copy of the table (see _osc_bake_preset); otherwise the
+        # plain table plays and dist_* below does the work.
+        proc = _osc_bake_preset(which)
+        kw["preset"] = proc if proc is not None else wt_preset_or_fallback(idx)
     else:
         # No -DAMY_WAVETABLE in this firmware: keep every other feature alive
         # on a plain oscillator rather than rendering silence.
@@ -1872,9 +2080,14 @@ def build_voice(v, full=False):
     _send_head(sy, v, full)
 
 
+_voices_built = False
+
+
 def build_all(full=False):
+    global _voices_built
     for v in range(NVOICE):
         build_voice(v, full)
+    _voices_built = True
 
 
 # --------------------------------------------------------------------------
@@ -1959,6 +2172,13 @@ def apply_fx():
             _amy_send(bus=BUS, dist_crush="0")
         _amy_send(bus=BUS, dist_drive="%.3f" % clamp(P["d_drive"], 0.0625, 16.0))
         _amy_send(bus=BUS, dist_mix="%.3f" % clamp(P["d_mix"], 0.0, 1.0))
+    else:
+        # No native bus distortion: fold the DRIVE page into the oscillators'
+        # baked tables instead, so the page still shapes the sound.  Guarded
+        # against boot recursion (the oscillators aren't built yet then).
+        if _voices_built:
+            apply_osc_a()
+            apply_osc_b()
     _amy_send(bus=BUS, eq="%.2f,%.2f,%.2f" % (P["eq_l"], P["eq_m"], P["eq_h"]))
     # chorus: level, max_delay (samples), lfo freq (Hz), depth
     _amy_send(bus=BUS, chorus="%.3f,%d,%.3f,%.3f"
@@ -4420,6 +4640,27 @@ def cv_status():
              cv_offset_volts(), CV_PITCH_MODE))
 
 
+def dist_status():
+    """How DRIVE/FOLD are being applied on this build.
+
+    If native distortion is missing, DRIVE/FOLD are waveshaped into the
+    oscillator tables (baked); this reports which oscillators are currently
+    baked and the drive/fold in effect."""
+    print("distortion: %s" % ("native AMY dist_*" if HAVE_DIST
+                              else "BAKED into tables (build has no dist_*)"))
+    for which in ("a", "b"):
+        sig = _bake_active(which)
+        print("  OSC %s: drive %.2f  fold %s  ->  %s"
+              % (which.upper(), _eff_osc_drive(which),
+                 "on" if P[which + "_fold"] else "off",
+                 "baked preset %d" % (WT_PROC_BASE + _bake_role(which))
+                 if (not HAVE_DIST and sig is not None) else
+                 ("native" if HAVE_DIST else "clean (no drive/fold)")))
+    print("  bus DRIVE page: drive %.2f fold %s bits %d rate %d"
+          % (P["d_drive"], "on" if P["d_fold"] else "off",
+             int(P["d_bits"]), int(P["d_rate"])))
+
+
 def sd_ls(dirpath=None, depth=0):
     """Raw recursive listing of the SD card, for diagnosing an empty scan.
 
@@ -4514,9 +4755,10 @@ def boot():
     # DRIVE/FOLD controls inert instead of crashing every voice build with
     # "Unknown keyword dist_clip".
     HAVE_DIST = _amy_knows("dist_clip")
-    print("AMY %s -- distortion FX %s"
+    print("AMY %s -- distortion: %s"
           % (getattr(amy, "version", "?"),
-             "available" if HAVE_DIST else "NOT in this build (DRIVE/FOLD off)"))
+             "native (dist_*)" if HAVE_DIST
+             else "no dist_* in this build -> DRIVE/FOLD baked into the tables"))
 
     # STARTUP CONTRACT: built-in tables only, no SD access.  The card is read
     # only later, on demand, from the WT LOAD page or when a patch names a
@@ -4607,6 +4849,7 @@ def loop(*args):
     global _loop_fault, _scope_t
     try:
         service_drift()
+        service_bake()           # settle a debounced drive/fold re-bake, if any
         poll_input()
         if need_redraw:
             draw()
