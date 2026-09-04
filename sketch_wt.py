@@ -4563,6 +4563,8 @@ def cv_status():
 
 
 CV_WATCH_FILE = "cv_gate_watch.txt"     # written to the SD root (or /user)
+CV_WATCH_ON_BOOT = True                 # auto-run the gate diagnostic at startup
+CV_WATCH_BOOT_SECS = 6                  # ...for this long (hold the gate high!)
 
 
 def cv_gate_watch(secs=4, stress=True):
@@ -4851,11 +4853,31 @@ def boot():
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
     print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) cv_status()")
-    print("  CV gate retrigger? run cv_gate_watch() with a steady gate held")
+    print("  CV gate diag auto-runs at boot -> SD:%s (hold gate high)"
+          % CV_WATCH_FILE)
     need_redraw = True
 
 
 boot()
+
+# Auto-run the CV-gate diagnostic once at startup (no REPL needed): hold the
+# gate high before powering on, and the report lands in CV_WATCH_FILE on the SD
+# card.  Set CV_WATCH_ON_BOOT = False to stop this once we have the data.
+# (Skipped under the offline test harness, which imports `stubs` first -- there
+# a real-time sampling loop would just stall the tests.)
+def _cv_watch_boot():
+    import sys
+    if not CV_WATCH_ON_BOOT or "stubs" in sys.modules:
+        return
+    try:
+        print("CV gate diagnostic: sampling %ds -- HOLD THE GATE HIGH..."
+              % CV_WATCH_BOOT_SECS)
+        cv_gate_watch(CV_WATCH_BOOT_SECS)
+    except Exception as _e:
+        print("cv_gate_watch (boot) failed:", _e)
+
+
+_cv_watch_boot()
 
 _loop_fault = False
 _scope_t = 0
