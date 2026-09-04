@@ -2020,10 +2020,15 @@ def apply_rebuild():
     """A full reallocation.  Cuts held notes, and is only reached by the few
     controls that genuinely cannot take effect any other way -- PH.SYNC (AMY
     has no command to un-set a trigger_phase) and the per-oscillator start
-    phases it arms."""
+    phases it arms.
+
+    Does NOT re-arm the gate: cv_trigger is a SYNTH-scoped mapping, not part of
+    an oscillator, so rebuilding the oscillators leaves it untouched.  Re-arming
+    here is what made turning PHASE / PH.SYNC / PH SPR retrigger the CV gate, so
+    it is gone -- only amy.reset() (panic, boot) actually clears the mapping,
+    and those re-arm explicitly."""
     all_off()
     build_all(full=True)
-    setup_cv()          # a full rebuild resets the oscillators; re-arm the gate
 
 
 def apply_none():
@@ -2059,13 +2064,37 @@ def _cv_send(what, **kwargs):
         print("CV %s send failed:" % what, e)
 
 
+_cv_trigger_sig = None          # last-armed (clear,on,off) tuple; None = unknown
+
+
+def _cv_forget():
+    """Drop the cached gate signature so the NEXT setup_cv() re-arms for real.
+
+    Call this whenever AMY's trigger list is wiped out from under us -- only
+    amy.reset() does that (panic, boot) -- so the cache never claims a trigger
+    is live when the engine has actually forgotten it."""
+    global _cv_trigger_sig
+    _cv_trigger_sig = None
+
+
 def setup_cv():
     """Register the gate as a pair of AMY 'cv_trigger' mappings (audio-thread).
 
     One trigger per edge direction, each on its own hysteresis pair, because a
     single cv_trigger only fires in one direction.  The note is addressed to
     voice 0's HEAD -- a chained oscillator refuses notes, so the head is the
-    only member that can take one, and it propagates the note down the chain."""
+    only member that can take one, and it propagates the note down the chain.
+
+    CRITICAL (gate retrigger fix): AMY's cv_trigger_new() APPENDS to a linked
+    list -- sending a fresh trigger never replaces the old one, and the only way
+    to remove a mapping is a bare 'ig<cv>' message (cv_trigger_clear_mappings).
+    The old code re-sent the two full triggers on every call WITHOUT clearing,
+    so each setup_cv() leaked two more gate mappings; after a few menu tweaks
+    AMY held a stack of identical gate-ons that ALL fired on the next edge --
+    heard as the gate retriggering.  So we now (1) CLEAR the gate CV first, then
+    (2) add exactly two mappings, and (3) skip the whole thing when the template
+    is unchanged, so an unrelated menu change never even re-arms the gate."""
+    global _cv_trigger_sig
     if not CV_ENABLED:
         return
     sy = _cv_synth()
@@ -2082,13 +2111,20 @@ def setup_cv():
         # the oscillators' ext freq coefficient continuously (cv_pitch_coefs).
         note_on_msg = "i%dv%dl%gn%g" % (sy, HEAD, CV_GATE_VEL, cv_base_note())
         pitch_args = ""
-    _cv_send("gate-on", synth=sy,
-             cv_trigger="%d,%g,%g%s,%s" % (CV_GATE_INPUT, CV_GATE_ON,
-                                           CV_GATE_OFF, pitch_args, note_on_msg))
+    on_msg = "%d,%g,%g%s,%s" % (CV_GATE_INPUT, CV_GATE_ON, CV_GATE_OFF,
+                               pitch_args, note_on_msg)
     # The note-off trigger never needs pitch args -- it only releases the voice.
-    _cv_send("gate-off", synth=sy,
-             cv_trigger="%d,%g,%g,%s" % (CV_GATE_INPUT, CV_GATE_OFF,
-                                         CV_GATE_ON, note_off_msg))
+    off_msg = "%d,%g,%g,%s" % (CV_GATE_INPUT, CV_GATE_OFF, CV_GATE_ON,
+                              note_off_msg)
+    sig = (sy, CV_GATE_INPUT, on_msg, off_msg)
+    if sig == _cv_trigger_sig:
+        return                       # gate already armed with this exact template
+    # Clear the gate CV's existing mappings (bare 'ig<cv>') so we REPLACE, never
+    # stack, then add the two fresh edges.
+    _cv_send("gate-clear", synth=sy, cv_trigger="%d" % CV_GATE_INPUT)
+    _cv_send("gate-on", synth=sy, cv_trigger=on_msg)
+    _cv_send("gate-off", synth=sy, cv_trigger=off_msg)
+    _cv_trigger_sig = sig
 
 
 def push_cv_pitch():
@@ -2417,6 +2453,7 @@ def panic():
     """The one place besides boot that is allowed to reset AMY."""
     all_off()
     amy.reset()
+    _cv_forget()        # reset() wiped the gate mappings -> force a real re-arm
     boot_amy()
     build_all(full=True)
     apply_fx()
