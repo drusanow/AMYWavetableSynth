@@ -4554,6 +4554,73 @@ def cv_status():
              cv_offset_volts(), CV_PITCH_MODE))
 
 
+def cv_gate_watch(secs=4, stress=True):
+    """Diagnose CV-gate RETRIGGERING on menu changes (REPL only).
+
+    The gate note only re-attacks on a real edge on the gate jack; AMY's edge
+    detector RESETS the moment the gate dips below CV_GATE_OFF and re-fires when
+    it climbs back over CV_GATE_ON -- so a brief DIP in the gate input reads as a
+    retrigger.  This samples the gate ADC as fast as it can and, when `stress`
+    is on, forces a full OLED refresh each pass (what a menu change does) to see
+    whether the refresh drags the gate reading down across the reset threshold.
+
+    Hold a steady gate high on the jack, run cv_gate_watch(), and read the DIPS
+    count: >0 while the gate is meant to be steady means the input is glitching
+    (electrical -- OLED/I2C/rail coupling), not the synth software."""
+    try:
+        amyboard.cv_in(CV_GATE_INPUT)
+    except Exception as e:
+        print("cv_in() unavailable -- run this on the board:", e)
+        return
+    t0 = _now()
+    n = 0
+    dips = 0
+    in_dip = False
+    lo = 99.0
+    hi = -99.0
+    refreshes = 0
+    dip_on_refresh = 0
+    while _dt(_now(), t0) < secs * 1000:
+        try:
+            g = amyboard.cv_in(CV_GATE_INPUT)
+        except Exception:
+            continue
+        n += 1
+        if g < lo:
+            lo = g
+        if g > hi:
+            hi = g
+        below = g < CV_GATE_OFF
+        if below and not in_dip:
+            dips += 1
+        in_dip = below
+        if stress and DISPLAY_OK and (n & 3) == 0:
+            # Force the exact I2C burst a menu redraw causes, then re-sample:
+            # if the gate reads low right after, the refresh is the culprit.
+            try:
+                display_refresh()
+                refreshes += 1
+                g2 = amyboard.cv_in(CV_GATE_INPUT)
+                if g2 < CV_GATE_OFF:
+                    dip_on_refresh += 1
+            except Exception:
+                pass
+    print("gate watch: %d samples over %ds" % (n, secs))
+    print("  gate range: %.3f .. %.3f V   (reset<%.2f, trigger>%.2f)"
+          % (lo, hi, CV_GATE_OFF, CV_GATE_ON))
+    print("  DIPS below reset: %d   (each dip = one spurious retrigger)" % dips)
+    if stress:
+        print("  forced refreshes: %d, of which the gate read low right after: %d"
+              % (refreshes, dip_on_refresh))
+    if dips == 0:
+        print("  -> gate input is STEADY here; retrigger is not a gate dip.")
+    elif stress and dip_on_refresh > 0:
+        print("  -> the OLED refresh is dragging the gate down: electrical "
+              "coupling, not the synth code.")
+    else:
+        print("  -> gate is dipping on its own: check the jack / source / wiring.")
+
+
 def dist_status():
     """Whether this build's DRIVE/FOLD run in the engine (native dist_*)."""
     if HAVE_DIST:
@@ -4740,6 +4807,7 @@ def boot():
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
     print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) cv_status()")
+    print("  CV gate retrigger? run cv_gate_watch() with a steady gate held")
     need_redraw = True
 
 
