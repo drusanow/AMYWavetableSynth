@@ -2015,6 +2015,8 @@ def apply_mode():
     changes is which voices get sent a note, plus a resend of the per-voice
     coefficients, because detune / pan / position spread apply in UNISON and
     collapse to zero in MONO and POLY."""
+    if DEBUG_LOG:
+        dbg("apply_mode()")
     all_off()
     apply_matrix()
 
@@ -2035,6 +2037,8 @@ def apply_rebuild():
     here is what made turning PHASE / PH.SYNC / PH SPR retrigger the CV gate, so
     it is gone -- only amy.reset() (panic, boot) actually clears the mapping,
     and those re-arm explicitly."""
+    if DEBUG_LOG:
+        dbg("apply_rebuild()")
     all_off()
     build_all(full=True)
 
@@ -2126,7 +2130,11 @@ def setup_cv():
                               note_off_msg)
     sig = (sy, CV_GATE_INPUT, on_msg, off_msg)
     if sig == _cv_trigger_sig:
+        if DEBUG_LOG:
+            dbg("CV_ARM cached (no change)")
         return                       # gate already armed with this exact template
+    if DEBUG_LOG:
+        dbg("CV_ARM re-arm on=%s" % on_msg)
     # Clear the gate CV's existing mappings (bare 'ig<cv>') so we REPLACE, never
     # stack, then add the two fresh edges.
     _cv_send("gate-clear", synth=sy, cv_trigger="%d" % CV_GATE_INPUT)
@@ -2315,6 +2323,103 @@ def mark_apply(group):
         _apply_dirty.add(group)
 
 
+# --------------------------------------------------------------------------
+#  RUNTIME DEBUG LOG  --  trace menu/CV events to SD while the app runs
+# --------------------------------------------------------------------------
+#  For diagnosing the CV-gate retrigger: every parameter edit, apply flush,
+#  gate re-arm, note on/off, rebuild and gate-threshold crossing is timestamped
+#  into a RAM buffer and appended to DEBUG_LOG_FILE on the SD card about once a
+#  second (never on the audio path).  Replicate the retrigger, then read the
+#  file -- the sequence right before the note re-attacks names the culprit.
+#  Set DEBUG_LOG = False to switch it all off.
+DEBUG_LOG = True
+DEBUG_LOG_FILE = "wt_debug.txt"
+_dbg_buf = []
+_dbg_last_flush = 0
+_dbg_path = None
+_dbg_fresh = True                        # first flush of a session truncates
+_dbg_gate_state = None
+_dbg_out_hi = 0.0
+
+
+def dbg(msg):
+    """Append one timestamped line to the debug buffer (never raises)."""
+    if not DEBUG_LOG:
+        return
+    try:
+        _dbg_buf.append("%d %s" % (_now(), msg))
+        if len(_dbg_buf) > 600:          # bound RAM: drop the oldest half
+            del _dbg_buf[:300]
+    except Exception:
+        pass
+
+
+def dbg_flush(force=False):
+    """Append the buffer to SD, throttled ~1/s.  Called from loop()."""
+    global _dbg_last_flush, _dbg_path, _dbg_fresh
+    if not DEBUG_LOG or not _dbg_buf:
+        return
+    now = _now()
+    if not force and _dt(now, _dbg_last_flush) < 1000:
+        return
+    _dbg_last_flush = now
+    if _dbg_path is None:
+        _dbg_path = (_sd_card_root() or "/user") + "/" + DEBUG_LOG_FILE
+    try:
+        # First write of a session truncates (fresh file per power-cycle); then
+        # append so the whole session accumulates in one readable file.
+        with open(_dbg_path, "w" if _dbg_fresh else "a") as f:
+            f.write("\n".join(_dbg_buf) + "\n")
+        _dbg_fresh = False
+        del _dbg_buf[:]
+    except Exception:
+        pass
+
+
+def dbg_service(force=False):
+    """Watch the gate and the output level each loop; log the interesting
+    transitions.  This is what catches a real retrigger AS IT HAPPENS: a gate
+    threshold crossing, or the summed output jumping from quiet back up to an
+    attack (a re-attack) with no key played."""
+    global _dbg_gate_state, _dbg_out_hi
+    if not DEBUG_LOG:
+        return
+    # gate crossings (a real edge would explain a legit re-fire)
+    try:
+        g = amyboard.cv_in(CV_GATE_INPUT)
+        st = 1 if g >= CV_GATE_ON else (0 if g < CV_GATE_OFF else _dbg_gate_state)
+        if st != _dbg_gate_state:
+            dbg("GATE->%s %.3fV" % ("HIGH" if st == 1 else
+                                    ("LOW" if st == 0 else "mid"), g))
+            _dbg_gate_state = st
+    except Exception:
+        pass
+    # output re-attack detector: peak of the post-FX buffer.  A jump from low
+    # back up to a strong level is an envelope re-attack (the retrigger) even
+    # when it was fired inside AMY by cv_trigger and the sketch never saw a note.
+    try:
+        buf = amy.get_output_buffer()
+        if buf:
+            pk = 0
+            step = max(1, len(buf) // 64)
+            i = 0
+            while i < len(buf):
+                a = buf[i]
+                if a < 0:
+                    a = -a
+                if a > pk:
+                    pk = a
+                i += step
+            pk = pk / 32768.0
+            if pk > 0.12 and pk > _dbg_out_hi * 1.8 + 0.05:
+                dbg("OUT_ATTACK peak=%.3f (was %.3f)" % (pk, _dbg_out_hi))
+            # slow decay of the reference so a sustained note doesn't keep arming
+            _dbg_out_hi = pk if pk > _dbg_out_hi else _dbg_out_hi * 0.9 + pk * 0.1
+    except Exception:
+        pass
+    dbg_flush(force)
+
+
 def service_apply():
     """Flush all apply groups marked dirty this tick, coalesced.  Called from
     loop() right after input, so the frame that draws already reflects it."""
@@ -2322,6 +2427,8 @@ def service_apply():
         return
     groups = set(_apply_dirty)
     _apply_dirty.clear()
+    if DEBUG_LOG:
+        dbg("APPLY %s" % ",".join(sorted(groups)))
     # Run at most one of the note-cutting supergroups, drop what it covers.
     for boss in ("rebuild", "mode", "uni", "mx", "ab"):
         if boss in groups:
@@ -2353,6 +2460,8 @@ _cur_vel = 0.0
 def _voice_note_on(v, note, vel, retrigger=True):
     sy = VOICE_SYNTHS[v]
     n = clamp(note, 0, 127)
+    if DEBUG_LOG:
+        dbg("NOTE_ON v%d n%.2f vel%.2f rt%d" % (v, n, vel, 1 if retrigger else 0))
     if retrigger:
         # Retrigger the two mod oscillators' phase if asked.  This has to be a
         # `phase` parameter message, not a note event: a mod-source osc ignores
@@ -2371,6 +2480,8 @@ def _voice_note_on(v, note, vel, retrigger=True):
 def _voice_note_off(v):
     if _vnote[v] is None:
         return
+    if DEBUG_LOG:
+        dbg("NOTE_OFF v%d" % v)
     _amy_send(synth=VOICE_SYNTHS[v], osc=HEAD, vel=0)
     _vnote[v] = None
 
@@ -4165,7 +4276,12 @@ def edit_row(idx, delta):
         return
     # Mark, don't send: service_apply() flushes it once at the end of the tick
     # so a fast sweep is one coalesced apply, not one per detent (#2).
-    mark_apply(bump(rows[idx], delta))
+    key = rows[idx][1]
+    g = bump(rows[idx], delta)
+    if DEBUG_LOG:
+        dbg("EDIT %s=%s grp=%s" % (key, fmt_value(key, eff_row(rows[idx])[5],
+                                                   P[key]), g))
+    mark_apply(g)
     need_redraw = True
 
 
@@ -4563,7 +4679,7 @@ def cv_status():
 
 
 CV_WATCH_FILE = "cv_gate_watch.txt"     # written to the SD root (or /user)
-CV_WATCH_ON_BOOT = True                 # auto-run the gate diagnostic at startup
+CV_WATCH_ON_BOOT = False                # auto-run the gate diagnostic at startup
 CV_WATCH_BOOT_SECS = 6                  # ...for this long (hold the gate high!)
 
 
@@ -4853,8 +4969,13 @@ def boot():
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
     print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) cv_status()")
-    print("  CV gate diag auto-runs at boot -> SD:%s (hold gate high)"
-          % CV_WATCH_FILE)
+    if DEBUG_LOG:
+        print("  DEBUG LOG ON -> SD:%s  (replicate the retrigger, then read it)"
+              % DEBUG_LOG_FILE)
+        dbg("==== session start: AMY %s, mode %s, gate CV%d on>%.2f off<%.2f ===="
+            % (getattr(amy, "version", "?"), CV_PITCH_MODE, CV_GATE_INPUT,
+               CV_GATE_ON, CV_GATE_OFF))
+        dbg_flush(force=True)
     need_redraw = True
 
 
@@ -4898,6 +5019,9 @@ def loop(*args):
         # #2: flush the tick's coalesced parameter changes as one burst BEFORE
         # drawing, so the frame we paint already reflects them.
         service_apply()
+        # Runtime debug trace (gate crossings + output re-attacks) to SD.
+        if DEBUG_LOG:
+            dbg_service()
         now = _now()
         # #1: the full redraw (fill + grid + visual + a blocking full-panel
         # I2C flush) is throttled and decoupled from the loop rate.  A skipped
