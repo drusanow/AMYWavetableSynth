@@ -319,8 +319,16 @@ CV_PITCH_MODE  = 'track'   # 'track' (continuous) or 'gate' (sample-at-gate)
 CV_ENABLED     = True      # False leaves both CV jacks disconnected from audio
 CV_GATE_INPUT  = 0         # CV1 jack: gate/trigger
 CV_PITCH_INPUT = 1         # CV2 jack: 1V/oct pitch
+# Gate hysteresis.  AMY's cv_trigger RESETS the moment the gate dips below
+# CV_GATE_OFF and re-fires above CV_GATE_ON, so a brief dip in the gate input --
+# e.g. the I2C burst of a full OLED refresh momentarily loading the CV rail on a
+# menu change -- reads as a spurious RETRIGGER.  A real eurorack gate idles at
+# 0 V, so the reset threshold can sit very low without affecting note-off: a WIDE
+# gap (small ratio) means a shallow dip never crosses reset.  0.2 keeps ~2 V of
+# immunity at the default 2.5 V gate.
+GATE_HYST_RATIO = 0.2
 CV_GATE_ON     = 2.5       # gate opens above this many volts...
-CV_GATE_OFF    = 1.25      # ...and closes below this (hysteresis)
+CV_GATE_OFF    = CV_GATE_ON * GATE_HYST_RATIO   # ...and stays open until it dips below this
 CV_GATE_VEL    = 1.0       # velocity (0..1) given to CV-gated notes
 CV_BASE_NOTE   = 60        # MIDI note that 0V on the pitch jack sounds
 CV_PITCH_TRIM_CENTS = 0.0  # + raises everything, - lowers (offset, cents)
@@ -2165,7 +2173,7 @@ def load_cv_cal():
         CV_PITCH_OFFSET_V = float(d.get("offset", CV_PITCH_OFFSET_V))
         CV_PITCH_COARSE_V = float(d.get("coarse", CV_PITCH_COARSE_V))
         CV_GATE_ON = float(d.get("gate_on", CV_GATE_ON))
-        CV_GATE_OFF = CV_GATE_ON * 0.5
+        CV_GATE_OFF = CV_GATE_ON * GATE_HYST_RATIO
         CV_BASE_NOTE = int(d.get("base", CV_BASE_NOTE))
     except Exception as e:
         print("cv cal load failed:", e)
@@ -2215,7 +2223,7 @@ def apply_cvcal():
         atten_changed = True
     if CV_GATE_ON != P["cvgate"]:
         CV_GATE_ON = P["cvgate"]
-        CV_GATE_OFF = CV_GATE_ON * 0.5   # release follows at half; one knob
+        CV_GATE_OFF = CV_GATE_ON * GATE_HYST_RATIO   # wide gap resists gate dips
         gate_changed = True
     if CV_BASE_NOTE != int(P["cvnote"]):
         CV_BASE_NOTE = int(P["cvnote"])
