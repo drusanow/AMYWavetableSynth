@@ -4562,6 +4562,9 @@ def cv_status():
              cv_offset_volts(), CV_PITCH_MODE))
 
 
+CV_WATCH_FILE = "cv_gate_watch.txt"     # written to the SD root (or /user)
+
+
 def cv_gate_watch(secs=4, stress=True):
     """Diagnose CV-gate RETRIGGERING on menu changes (REPL only).
 
@@ -4574,7 +4577,16 @@ def cv_gate_watch(secs=4, stress=True):
 
     Hold a steady gate high on the jack, run cv_gate_watch(), and read the DIPS
     count: >0 while the gate is meant to be steady means the input is glitching
-    (electrical -- OLED/I2C/rail coupling), not the synth software."""
+    (electrical -- OLED/I2C/rail coupling), not the synth software.
+
+    The full report is ALSO written to CV_WATCH_FILE on the SD card (falling
+    back to /user) so it can be copied off the board and pasted verbatim."""
+    lines = []
+
+    def out(s):                         # print live AND capture for the file
+        print(s)
+        lines.append(s)
+
     try:
         amyboard.cv_in(CV_GATE_INPUT)
     except Exception as e:
@@ -4588,6 +4600,8 @@ def cv_gate_watch(secs=4, stress=True):
     hi = -99.0
     refreshes = 0
     dip_on_refresh = 0
+    worst_refresh = 99.0                # lowest reading seen right after a refresh
+    trace = []                          # a few (refresh#, volts) samples for depth
     while _dt(_now(), t0) < secs * 1000:
         try:
             g = amyboard.cv_in(CV_GATE_INPUT)
@@ -4609,24 +4623,46 @@ def cv_gate_watch(secs=4, stress=True):
                 display_refresh()
                 refreshes += 1
                 g2 = amyboard.cv_in(CV_GATE_INPUT)
+                if g2 < worst_refresh:
+                    worst_refresh = g2
                 if g2 < CV_GATE_OFF:
                     dip_on_refresh += 1
+                if len(trace) < 24:     # keep the file small
+                    trace.append((refreshes, g2))
             except Exception:
                 pass
-    print("gate watch: %d samples over %ds" % (n, secs))
-    print("  gate range: %.3f .. %.3f V   (reset<%.2f, trigger>%.2f)"
-          % (lo, hi, CV_GATE_OFF, CV_GATE_ON))
-    print("  DIPS below reset: %d   (each dip = one spurious retrigger)" % dips)
+
+    out("=== cv_gate_watch ===")
+    out("AMY %s  mode %s  stress %s" % (getattr(amy, "version", "?"),
+                                        CV_PITCH_MODE, stress))
+    out("samples: %d over %ds" % (n, secs))
+    out("gate range: %.3f .. %.3f V   (reset<%.2f, trigger>%.2f, hyst x%.2f)"
+        % (lo, hi, CV_GATE_OFF, CV_GATE_ON, GATE_HYST_RATIO))
+    out("DIPS below reset: %d   (each dip = one spurious retrigger)" % dips)
     if stress:
-        print("  forced refreshes: %d, of which the gate read low right after: %d"
-              % (refreshes, dip_on_refresh))
+        out("forced refreshes: %d;  gate read low right after: %d;  worst %.3f V"
+            % (refreshes, dip_on_refresh, worst_refresh if refreshes else 0.0))
+        if trace:
+            out("post-refresh trace (refresh#: volts):")
+            out("  " + "  ".join("%d:%.2f" % (r, v) for r, v in trace))
     if dips == 0:
-        print("  -> gate input is STEADY here; retrigger is not a gate dip.")
+        out("-> gate input STEADY here; retrigger is not a gate dip.")
     elif stress and dip_on_refresh > 0:
-        print("  -> the OLED refresh is dragging the gate down: electrical "
-              "coupling, not the synth code.")
+        out("-> the OLED refresh drags the gate down: electrical coupling, "
+            "not the synth code.")
     else:
-        print("  -> gate is dipping on its own: check the jack / source / wiring.")
+        out("-> gate dipping on its own: check the jack / source / wiring.")
+
+    # Write the report to the SD card (root), or /user if there is no card.
+    root = _sd_card_root() or "/user"
+    path = root + "/" + CV_WATCH_FILE
+    try:
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print("written to: %s" % path)
+    except Exception as e:
+        print("could not write %s: %s" % (path, e))
+        print("(copy the lines above by hand instead.)")
 
 
 def dist_status():
