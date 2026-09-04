@@ -330,6 +330,17 @@ GATE_HYST_RATIO = 0.2
 CV_GATE_ON     = 2.5       # gate opens above this many volts...
 CV_GATE_OFF    = CV_GATE_ON * GATE_HYST_RATIO   # ...and stays open until it dips below this
 CV_GATE_VEL    = 1.0       # velocity (0..1) given to CV-gated notes
+
+# SOFTWARE GATE.  AMY's cv_trigger reads the gate on the AUDIO thread, so it
+# collides with the main thread's OLED I2C writes -- a ground/bus bounce then
+# drops the reading (measured going NEGATIVE) and it re-fires: the retrigger.
+# Handling the gate here in loop() instead (a) reads the ADC on the SAME thread
+# as the OLED, so the two serialise instead of colliding, and (b) debounces:
+# the gate must read low for CV_GATE_OFF_SAMPLES consecutive polls before the
+# note releases, so a brief bounce is ignored.  Note-on stays fast (fires on the
+# first high poll); only release carries the debounce.
+CV_GATE_SOFTWARE   = True  # handle the gate in the sketch, not AMY's cv_trigger
+CV_GATE_OFF_SAMPLES = 2    # consecutive low polls (~loops) required to release
 CV_BASE_NOTE   = 60        # MIDI note that 0V on the pitch jack sounds
 CV_PITCH_TRIM_CENTS = 0.0  # + raises everything, - lowers (offset, cents)
 CV_PITCH_SCALE      = 1.0  # octaves added per volt (1.0 = a true 1V/oct)
@@ -2084,9 +2095,12 @@ def _cv_forget():
 
     Call this whenever AMY's trigger list is wiped out from under us -- only
     amy.reset() does that (panic, boot) -- so the cache never claims a trigger
-    is live when the engine has actually forgotten it."""
-    global _cv_trigger_sig
+    is live when the engine has actually forgotten it.  Also drops the software
+    gate state so a held gate re-fires cleanly after the reset."""
+    global _cv_trigger_sig, _cv_gate_on, _cv_low_count
     _cv_trigger_sig = None
+    _cv_gate_on = False
+    _cv_low_count = 0
 
 
 def setup_cv():
@@ -2110,6 +2124,14 @@ def setup_cv():
     if not CV_ENABLED:
         return
     sy = _cv_synth()
+    if CV_GATE_SOFTWARE:
+        # The sketch runs the gate now (service_cv_gate); make sure AMY's own
+        # audio-thread trigger is NOT also firing on the same jack -- clear it.
+        _cv_send("gate-clear", synth=sy, cv_trigger="%d" % CV_GATE_INPUT)
+        _cv_trigger_sig = None
+        if DEBUG_LOG:
+            dbg("CV gate = SOFTWARE (AMY trigger cleared)")
+        return
     note_off_msg = "i%dv%dl0" % (sy, HEAD)
     if CV_PITCH_MODE == 'gate':
         # Hand cv_trigger the pitch CV too, so AMY samples it at the gate edge
@@ -2141,6 +2163,73 @@ def setup_cv():
     _cv_send("gate-on", synth=sy, cv_trigger=on_msg)
     _cv_send("gate-off", synth=sy, cv_trigger=off_msg)
     _cv_trigger_sig = sig
+
+
+# --------------------------------------------------------------------------
+#  SOFTWARE GATE  --  debounced, main-thread gate handling (see CV_GATE_SOFTWARE)
+# --------------------------------------------------------------------------
+_cv_gate_on = False         # committed gate state
+_cv_low_count = 0           # consecutive sub-threshold polls (release debounce)
+
+
+def _cv_note_on():
+    """Fire the CV note on voice 0's head, exactly as AMY's cv_trigger did.
+
+    In 'track' mode the head carries the base pitch and the live 1V/oct CV rides
+    the oscillators' ext coefficient; in 'gate' mode the pitch jack is sampled
+    now and baked into the note."""
+    sy = _cv_synth()
+    if CV_PITCH_MODE == 'gate':
+        try:
+            raw = amyboard.cv_in(CV_PITCH_INPUT)
+        except Exception:
+            raw = 0.0
+        note = cv_note_for(raw)
+    else:
+        note = cv_base_note()
+    note = clamp(note, 0.0, 127.0)
+    _amy_send(synth=sy, osc=HEAD, note=round(note, 3), vel=round(CV_GATE_VEL, 4))
+
+
+def _cv_note_off():
+    _amy_send(synth=_cv_synth(), osc=HEAD, vel=0)
+
+
+def service_cv_gate():
+    """Poll the gate jack once per loop and drive the CV note with debounce.
+
+    Runs on the MAIN thread (same as the OLED), so the ADC read never collides
+    with a display refresh the way AMY's audio-thread trigger did.  A brief dip
+    (ground/bus bounce) is rejected: the gate must read low for
+    CV_GATE_OFF_SAMPLES consecutive polls before the note releases."""
+    global _cv_gate_on, _cv_low_count
+    if not (CV_ENABLED and CV_GATE_SOFTWARE):
+        return
+    try:
+        g = amyboard.cv_in(CV_GATE_INPUT)
+    except Exception:
+        return
+    if not _cv_gate_on:
+        if g >= CV_GATE_ON:
+            _cv_note_on()
+            _cv_gate_on = True
+            _cv_low_count = 0
+            if DEBUG_LOG:
+                dbg("SWGATE on %.3fV" % g)
+    else:
+        if g < CV_GATE_OFF:
+            _cv_low_count += 1
+            if _cv_low_count >= CV_GATE_OFF_SAMPLES:
+                _cv_note_off()
+                _cv_gate_on = False
+                _cv_low_count = 0
+                if DEBUG_LOG:
+                    dbg("SWGATE off %.3fV" % g)
+        else:
+            if _cv_low_count and DEBUG_LOG:
+                # The debounce catching a bounce -- this is the fix at work.
+                dbg("SWGATE dip rejected %.3fV (held note)" % g)
+            _cv_low_count = 0
 
 
 def push_cv_pitch():
@@ -2384,16 +2473,19 @@ def dbg_service(force=False):
     global _dbg_gate_state, _dbg_out_hi
     if not DEBUG_LOG:
         return
-    # gate crossings (a real edge would explain a legit re-fire)
-    try:
-        g = amyboard.cv_in(CV_GATE_INPUT)
-        st = 1 if g >= CV_GATE_ON else (0 if g < CV_GATE_OFF else _dbg_gate_state)
-        if st != _dbg_gate_state:
-            dbg("GATE->%s %.3fV" % ("HIGH" if st == 1 else
-                                    ("LOW" if st == 0 else "mid"), g))
-            _dbg_gate_state = st
-    except Exception:
-        pass
+    # gate crossings (a real edge would explain a legit re-fire).  Skipped when
+    # the software gate owns the jack -- service_cv_gate() reads it and logs the
+    # SWGATE on/off/dip events, so re-reading here would just double the I2C.
+    if not CV_GATE_SOFTWARE:
+        try:
+            g = amyboard.cv_in(CV_GATE_INPUT)
+            st = 1 if g >= CV_GATE_ON else (0 if g < CV_GATE_OFF else _dbg_gate_state)
+            if st != _dbg_gate_state:
+                dbg("GATE->%s %.3fV" % ("HIGH" if st == 1 else
+                                        ("LOW" if st == 0 else "mid"), g))
+                _dbg_gate_state = st
+        except Exception:
+            pass
     # output re-attack detector: peak of the post-FX buffer.  A jump from low
     # back up to a strong level is an envelope re-attack (the retrigger) even
     # when it was fired inside AMY by cv_trigger and the sketch never saw a note.
@@ -5019,6 +5111,8 @@ def loop(*args):
         # #2: flush the tick's coalesced parameter changes as one burst BEFORE
         # drawing, so the frame we paint already reflects them.
         service_apply()
+        # Debounced software CV gate (main-thread; see CV_GATE_SOFTWARE).
+        service_cv_gate()
         # Runtime debug trace (gate crossings + output re-attacks) to SD.
         if DEBUG_LOG:
             dbg_service()
