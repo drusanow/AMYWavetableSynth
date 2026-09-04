@@ -2157,32 +2157,56 @@ def apply_cvcal():
     own file (CV_CAL_FILE).  To make sure it survives even if the app is closed
     right after a tweak, a change is written to flash promptly here (throttled
     so a knob sweep does not hammer the card), with a final flush on page
-    change (cv_cal_save_if_dirty)."""
+    change (cv_cal_save_if_dirty).
+
+    #4 -- MINIMAL CV re-push so a calibration tweak never glitches the gate:
+    the old code re-armed BOTH cv_trigger mappings (setup_cv) on every detent of
+    every knob, which could disturb a held, in-tune note.  The trim (OFFSET /
+    ATTEN) only rides the oscillator const in 'track' mode, so there a live
+    retune() is enough and the gate is left untouched; only the values that
+    actually change the trigger TEMPLATE (GATE V thresholds, 0V NOTE, and -- in
+    'gate' mode only -- the trim that AMY bakes into the note) re-arm it.  The
+    calibration numbers themselves are applied identically either way, so tuning
+    is preserved exactly; this only removes needless gate re-arms."""
     global CV_PITCH_OFFSET_V, CV_PITCH_COARSE_V, CV_GATE_ON, CV_GATE_OFF
     global CV_BASE_NOTE, _cal_dirty, _cv_cal_msg, _cal_last_save
-    changed = False
+    off_changed = atten_changed = gate_changed = note_changed = False
     if CV_PITCH_OFFSET_V != P["cvoff"]:
         CV_PITCH_OFFSET_V = P["cvoff"]
-        changed = True
+        off_changed = True
     if CV_PITCH_COARSE_V != P["cvatt"]:
         CV_PITCH_COARSE_V = P["cvatt"]
-        changed = True
+        atten_changed = True
     if CV_GATE_ON != P["cvgate"]:
         CV_GATE_ON = P["cvgate"]
         CV_GATE_OFF = CV_GATE_ON * 0.5   # release follows at half; one knob
-        changed = True
+        gate_changed = True
     if CV_BASE_NOTE != int(P["cvnote"]):
         CV_BASE_NOTE = int(P["cvnote"])
-        changed = True
-    if changed:
-        _cv_cal_msg = "trim %+.2fV" % cv_offset_volts()
-        push_cv_pitch()
-        _cal_dirty = True
-        now = _now()
-        if _dt(now, _cal_last_save) > 1000:      # at most ~1 write/second
-            if save_cv_cal():
-                _cal_dirty = False
-            _cal_last_save = now
+        note_changed = True
+    if not (off_changed or atten_changed or gate_changed or note_changed):
+        return
+    _cv_cal_msg = "trim %+.2fV" % cv_offset_volts()
+
+    # The trim rides the oscillator const in 'track' mode (cv_const_mult) and the
+    # note template in 'gate' mode (cv_base_note); GATE V and 0V NOTE always live
+    # in the trigger template.  Re-arm the gate ONLY when the template actually
+    # moved; otherwise just retune the live oscillators.
+    trim_changed = off_changed or atten_changed
+    need_gate = gate_changed or note_changed or (trim_changed
+                                                 and CV_PITCH_MODE == 'gate')
+    need_retune = trim_changed and CV_PITCH_MODE == 'track'
+    if need_gate:
+        setup_cv()          # thresholds / note template changed -> re-arm
+    if need_retune:
+        retune()            # trim rides the const -> correct held pitch live
+
+    _cal_dirty = True
+    now = _now()
+    if _dt(now, _cal_last_save) > 1000:          # at most ~1 write/second
+        if save_cv_cal():
+            _cal_dirty = False
+        _cal_last_save = now
 
 
 def cv_cal_save_if_dirty():
@@ -2212,6 +2236,57 @@ def apply_group(group):
             fn()
         except Exception as e:
             print("apply", group, "failed:", e)
+
+
+# --------------------------------------------------------------------------
+#  APPLY COALESCING  --  one AMY flush per loop tick, not one per encoder detent
+# --------------------------------------------------------------------------
+#  An encoder sweep fires edit_row() on every detent.  Applying each one on the
+#  spot floods the audio thread (a UNISON detune is 12 sends -- turn it fast and
+#  a single 60 ms tick can carry dozens).  Instead each edit only MARKS its
+#  apply group dirty; service_apply() flushes the accumulated set ONCE per tick
+#  from loop().  N detents of the same knob in a tick then cost one apply, and
+#  the note/gate state a held voice sees is refreshed once, cleanly, per frame.
+#
+#  Note events (note_on/off), MIDI CCs and one-shot click actions still apply
+#  immediately -- only the continuous encoder path is coalesced.
+_apply_dirty = set()
+
+# When two knobs move in the same tick, an expensive note-cutting group
+# subsumes the cheap per-osc groups it already resends, so a rebuild never runs
+# on top of (and re-cuts the notes of) an apply_osc_a queued alongside it.
+_SUBSUMES = {
+    "rebuild": {"rebuild", "mode", "uni", "mx", "ab", "a", "b", "head",
+                "m1", "m2", "env"},
+    "mode":    {"mode", "uni", "mx", "ab", "a", "b", "head"},
+    "uni":     {"uni", "mx", "ab", "a", "b", "head"},
+    "mx":      {"mx", "uni", "ab", "a", "b", "head"},
+    "ab":      {"ab", "a", "b"},
+}
+
+
+def mark_apply(group):
+    """Queue an apply group for the next service_apply() flush."""
+    if group and group != "none":
+        _apply_dirty.add(group)
+
+
+def service_apply():
+    """Flush all apply groups marked dirty this tick, coalesced.  Called from
+    loop() right after input, so the frame that draws already reflects it."""
+    if not _apply_dirty:
+        return
+    groups = set(_apply_dirty)
+    _apply_dirty.clear()
+    # Run at most one of the note-cutting supergroups, drop what it covers.
+    for boss in ("rebuild", "mode", "uni", "mx", "ab"):
+        if boss in groups:
+            apply_group(boss)
+            groups -= _SUBSUMES[boss]
+            break
+    # Everything left is independent (head, env, fx, sys, cvcal, m1, m2, ...).
+    for g in groups:
+        apply_group(g)
 
 
 # --------------------------------------------------------------------------
@@ -4043,7 +4118,9 @@ def edit_row(idx, delta):
     rows = cur_rows()
     if idx < 0 or idx >= len(rows):
         return
-    apply_group(bump(rows[idx], delta))
+    # Mark, don't send: service_apply() flushes it once at the end of the tick
+    # so a fast sweep is one coalesced apply, not one per detent (#2).
+    mark_apply(bump(rows[idx], delta))
     need_redraw = True
 
 
@@ -4633,7 +4710,9 @@ boot()
 
 _loop_fault = False
 _scope_t = 0
+_ui_t = 0
 SCOPE_MS = 90           # the scope's own refresh cadence, MIX page only
+UI_MS = 45              # #1: cap the interactive full-redraw rate (~22 fps)
 
 
 def loop(*args):
@@ -4641,32 +4720,42 @@ def loop(*args):
 
     Nothing here is audio-rate.  The heaviest thing it can do is service_drift,
     which sends at most 8 messages and only when DRIFT is turned up."""
-    global _loop_fault, _scope_t
+    global _loop_fault, _scope_t, _ui_t
     try:
         service_drift()
         poll_input()
-        if need_redraw:
-            draw()
-        elif (HAVE_BOARD and DISPLAY_OK and not is_patch_page()
-              and PAGES[page][0] == "MIX"):
-            # The scope has to keep moving even when nothing changed --
-            # need_redraw only fires on USER input, and audio plays without
-            # any.  Throttled and self-contained (it clears and redraws only
-            # its own band), because bright OLED pixels couple noise into the
-            # audio path on this hardware.
-            now = _now()
-            if _dt(now, _scope_t) >= SCOPE_MS:
-                _scope_t = now
-                draw_scope(amyboard.display)
+        # #2: flush the tick's coalesced parameter changes as one burst BEFORE
+        # drawing, so the frame we paint already reflects them.
+        service_apply()
+        now = _now()
+        # #1: the full redraw (fill + grid + visual + a blocking full-panel
+        # I2C flush) is throttled and decoupled from the loop rate.  A skipped
+        # frame leaves need_redraw latched, so the FINAL state of a sweep always
+        # lands -- input is never lost, only intermediate frames are dropped,
+        # which keeps the OLED (a noise source into the audio path) quiet under
+        # a fast knob spin.
+        if need_redraw and _dt(now, _ui_t) >= UI_MS:
+            _ui_t = now
+            draw()                       # clears need_redraw
+        elif not need_redraw and HAVE_BOARD and DISPLAY_OK and not is_patch_page():
+            name = PAGES[page][0]
+            if name == "MIX":
+                # The scope has to keep moving even when nothing changed --
+                # need_redraw only fires on USER input, and audio plays without
+                # any.  Throttled and self-contained (it clears and redraws only
+                # its own band), because bright OLED pixels couple noise into
+                # the audio path on this hardware.
+                if _dt(now, _scope_t) >= SCOPE_MS:
+                    _scope_t = now
+                    draw_scope(amyboard.display)
+                    display_refresh()
+            elif name == "CV CAL":
+                # The CV jacks move without any user input, so a need_redraw-
+                # gated readout would sit stale.  Only the pane is redrawn, and
+                # the reading behind it is throttled (CV_VIS_MS).
+                y0, h = vis_band()
+                draw_vis_cvcal(amyboard.display, y0, h)
                 display_refresh()
-        elif (HAVE_BOARD and DISPLAY_OK and not is_patch_page()
-              and PAGES[page][0] == "CV CAL"):
-            # The CV jacks move without any user input, so a need_redraw-gated
-            # readout would sit stale.  Only the pane is redrawn, and the
-            # reading behind it is throttled (CV_VIS_MS).
-            y0, h = vis_band()
-            draw_vis_cvcal(amyboard.display, y0, h)
-            display_refresh()
     except Exception as e:
         # loop() runs every ~60 ms: print the real traceback once, then stay
         # quiet, or a recurring fault floods the console and buries the one
