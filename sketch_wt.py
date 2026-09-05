@@ -3331,6 +3331,17 @@ OLED_ADDR = 0x3D
 DISPLAY_ROTATION = 0
 DISPLAY_OK = False
 
+# Screen FADE-UP.  When the whole screen changes (page change / entering or
+# leaving the screen picker) the panel is dipped dark and ramped back to
+# OLED_CONTRAST over OLED_FADE_MS.  It softens the brightness step -- a smaller
+# di/dt on the panel's illumination current, which is gentler on the shared CV
+# ground -- and it simply looks nice.  It does NOT shrink the framebuffer's I2C
+# burst, so the real CV-retrigger fix stays the software gate; this is polish.
+OLED_FADE     = True
+OLED_CONTRAST = 0x80       # steady brightness (SH1107 power-on default); tunable
+OLED_FADE_MIN = 0x00       # brightness at the instant a new screen appears
+OLED_FADE_MS  = 180        # ramp time OLED_FADE_MIN -> OLED_CONTRAST
+
 PATCH_PAGE = len(PAGES)
 N_PAGES = len(PAGES) + 1
 
@@ -3406,6 +3417,10 @@ def init_display():
         DISPLAY_OK = False
     print("init_display: SH1107 at 0x%02X rot %d -- %s"
           % (OLED_ADDR, DISPLAY_ROTATION, "OK" if DISPLAY_OK else "no panel"))
+    if DISPLAY_OK and OLED_FADE:
+        # Establish the steady brightness the fade returns to, so a fade never
+        # shifts the baseline away from the driver's default.
+        _oled_set_contrast(OLED_CONTRAST)
     return DISPLAY_OK
 
 
@@ -3415,6 +3430,70 @@ def display_refresh():
             amyboard.display_refresh()
         except Exception as e:
             print("display_refresh failed:", e)
+
+
+# --------------------------------------------------------------------------
+#  SCREEN FADE-UP  (see OLED_FADE)
+# --------------------------------------------------------------------------
+_oled_c = -1                # last contrast value written (-1 = unknown)
+_fade_t0 = 0
+_fade_on = False
+
+
+def _oled_set_contrast(v):
+    """Write the SH1107 global contrast register (0..255).  No-op if the driver
+    doesn't expose contrast, or the value is unchanged."""
+    global _oled_c
+    v = int(clamp(v, 0, 255))
+    if v == _oled_c:
+        return
+    _oled_c = v
+    d = getattr(amyboard, "display", None)
+    if d is None:
+        return
+    # Drivers name it differently; try the usual ones, else the raw 0x81 cmd.
+    for name in ("contrast", "set_contrast"):
+        fn = getattr(d, name, None)
+        if fn is not None:
+            try:
+                fn(v)
+                return
+            except Exception:
+                pass
+    for name in ("write_cmd", "_write_command", "command"):
+        fn = getattr(d, name, None)
+        if fn is not None:
+            try:
+                fn(0x81)
+                fn(v)
+                return
+            except Exception:
+                pass
+
+
+def oled_fade_begin():
+    """Called on a whole-screen change: dip dark NOW (before the new frame is
+    pushed), then service_oled_fade() ramps back up over the next frames."""
+    global _fade_t0, _fade_on
+    if not (OLED_FADE and DISPLAY_OK):
+        return
+    _fade_t0 = _now()
+    _fade_on = True
+    _oled_set_contrast(OLED_FADE_MIN)
+
+
+def service_oled_fade():
+    """Advance an in-progress fade.  Called every loop; cheap no-op otherwise."""
+    global _fade_on
+    if not _fade_on:
+        return
+    el = _dt(_now(), _fade_t0)
+    if el >= OLED_FADE_MS:
+        _oled_set_contrast(OLED_CONTRAST)
+        _fade_on = False
+        return
+    frac = el / float(OLED_FADE_MS)
+    _oled_set_contrast(OLED_FADE_MIN + (OLED_CONTRAST - OLED_FADE_MIN) * frac)
 
 
 def is_patch_page():
@@ -4330,6 +4409,7 @@ def _goto_page(p):
         # Land on the MATRIX page showing the routing the cursor points at,
         # not a stale AMOUNT from the last time it was open.
         P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
+    oled_fade_begin()           # whole screen changed -> fade it up
     need_redraw = True
 
 
@@ -4473,12 +4553,14 @@ def _enter_page_mode():
     page_mode = True
     editing = False
     pmode = 'list'
+    oled_fade_begin()
     need_redraw = True
 
 
 def _exit_page_mode():
     global page_mode, need_redraw
     page_mode = False
+    oled_fade_begin()
     need_redraw = True
 
 
@@ -5145,6 +5227,8 @@ def loop(*args):
                 y0, h = vis_band()
                 draw_vis_cvcal(amyboard.display, y0, h)
                 display_refresh()
+        # Advance a screen fade-up, if one is in progress.
+        service_oled_fade()
     except Exception as e:
         # loop() runs every ~60 ms: print the real traceback once, then stay
         # quiet, or a recurring fault floods the console and buries the one
