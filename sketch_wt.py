@@ -3342,6 +3342,15 @@ OLED_CONTRAST = 0x80       # steady brightness (SH1107 power-on default); tunabl
 OLED_FADE_MIN = 0x00       # brightness at the instant a new screen appears
 OLED_FADE_MS  = 180        # ramp time OLED_FADE_MIN -> OLED_CONTRAST
 
+# I2C yield fallback.  Current AMYboard firmware pushes the OLED through a
+# background, 256-byte-chunked I2C task so the audio-thread CV reads interleave
+# between chunks (amyboard.Display sets display._bg = True).  On OLDER firmware
+# without that task the refresh writes blast back-to-back and can starve the CV
+# poll -- the Discord advice.  When the background path is ABSENT we wrap the
+# panel's blocking I2C with a shim that yields ~1ms every ~256 bytes, the manual
+# equivalent.  A no-op when the firmware already backgrounds the writes.
+OLED_CHUNK_FALLBACK = True
+
 PATCH_PAGE = len(PAGES)
 N_PAGES = len(PAGES) + 1
 
@@ -3377,6 +3386,79 @@ def toast(msg):
 def need_ui():
     global need_redraw
     need_redraw = True
+
+
+class _ChunkSleepI2C:
+    """Blocking-I2C shim that yields the bus ~1ms every ~256 bytes of pixel
+    data, so AMY's audio-thread CV reads interleave with a big OLED refresh
+    instead of being starved.  It is the manual equivalent of the firmware's
+    background chunker, for builds that lack tulip.i2c_bg_write; it just wraps
+    the panel's real I2C and adds the yields, so it can't race anything.
+
+    Mirrors how the sh1107 driver calls its bus: writeto() carries a command
+    (small -- passed straight through) and writevto() carries pixel data."""
+    _YIELD_EVERY = 256
+
+    def __init__(self, real):
+        self._real = real
+        self._acc = 0
+
+    def writeto(self, addr, buf, *a, **k):
+        return self._real.writeto(addr, buf, *a, **k)
+
+    def writevto(self, addr, bufs, *a, **k):
+        r = self._real.writevto(addr, bufs, *a, **k)
+        try:
+            for b in bufs:
+                self._acc += len(b)
+        except Exception:
+            self._acc += self._YIELD_EVERY
+        if self._acc >= self._YIELD_EVERY:
+            self._acc = 0
+            try:
+                time.sleep_ms(1)
+            except AttributeError:
+                time.sleep(0.001)
+        return r
+
+
+_oled_bg = False            # firmware backgrounds panel writes (display._bg)
+_oled_chunked = False       # we installed the _ChunkSleepI2C yield fallback
+
+
+def _install_i2c_yield():
+    """If the firmware is NOT backgrounding panel writes, wrap the panel's
+    blocking I2C so a refresh yields the bus for the CV reads (Discord advice).
+    Guarded/defensive: any failure just leaves the original path untouched."""
+    global _oled_bg, _oled_chunked
+    try:
+        d = getattr(amyboard, "display", None)
+        _oled_bg = bool(getattr(d, "_bg", False))
+        if _oled_bg or not OLED_CHUNK_FALLBACK:
+            return                       # firmware already interleaves -> leave it
+        hw = getattr(d, "_hw", None)
+        i2c = getattr(hw, "i2c", None) if hw is not None else None
+        if i2c is None or isinstance(i2c, _ChunkSleepI2C):
+            return
+        hw.i2c = _ChunkSleepI2C(i2c)
+        _oled_chunked = True
+    except Exception as e:
+        print("i2c yield shim: not installed (%s)" % e)
+
+
+def display_path_status():
+    """Report how OLED bytes reach the panel -- the key thing for audio glitches
+    during big redraws."""
+    if not DISPLAY_OK:
+        print("display: no panel")
+        return
+    if _oled_bg:
+        print("display I2C: firmware background chunker (CV-safe) -- ideal")
+    elif _oled_chunked:
+        print("display I2C: blocking + our ~1ms/256B yield shim (CV-safe)")
+    else:
+        print("display I2C: blocking, no yield -- a big redraw may glitch CV/"
+              "audio; update firmware for the background chunker")
 
 
 def init_display():
@@ -3417,10 +3499,13 @@ def init_display():
         DISPLAY_OK = False
     print("init_display: SH1107 at 0x%02X rot %d -- %s"
           % (OLED_ADDR, DISPLAY_ROTATION, "OK" if DISPLAY_OK else "no panel"))
-    if DISPLAY_OK and OLED_FADE:
-        # Establish the steady brightness the fade returns to, so a fade never
-        # shifts the baseline away from the driver's default.
-        _oled_set_contrast(OLED_CONTRAST)
+    if DISPLAY_OK:
+        _install_i2c_yield()        # CV-safe I2C on firmware without the bg task
+        display_path_status()
+        if OLED_FADE:
+            # Establish the steady brightness the fade returns to, so a fade
+            # never shifts the baseline away from the driver's default.
+            _oled_set_contrast(OLED_CONTRAST)
     return DISPLAY_OK
 
 
@@ -5142,7 +5227,8 @@ def boot():
 
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
-    print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) cv_status()")
+    print("REPL helpers: status() wt_scan() sd_ls() cv_status() "
+          "display_path_status()")
     if DEBUG_LOG:
         print("  DEBUG LOG ON -> SD:%s  (replicate the retrigger, then read it)"
               % DEBUG_LOG_FILE)
